@@ -14,7 +14,7 @@ npm run dev      # esbuild watch mode — rebuilds main.js on save (inline sourc
 npm run build    # production build — minified, no sourcemaps
 ```
 
-There is **no test suite, linter, or typecheck script**. `tsconfig.json` is used by esbuild for transpile only (`isolatedModules`, no `tsc` emit step). Verify changes by loading the built `main.js` in an Obsidian vault.
+There is **no test suite or linter**, and no typecheck npm script — but `npx tsc --noEmit` runs clean and is the fastest check after editing (esbuild does not typecheck). `tsconfig.json` is otherwise used by esbuild for transpile only (`isolatedModules`, `strictNullChecks`). Beyond that, verify by loading the built `main.js` in an Obsidian vault.
 
 The build entry is `src/main.ts` → bundled to `main.js` (git-ignored). To test in Obsidian, copy/symlink `main.js` + `manifest.json` into `<vault>/.obsidian/plugins/git-obsi-sync/`.
 
@@ -24,7 +24,7 @@ Releases are tag-triggered: pushing a git tag runs `.github/workflows/release.ym
 
 - **All HTTP must use Obsidian's `requestUrl`** (from the `obsidian` module), never `fetch`/`axios`. This is what makes mobile + CORS work. See `src/github/api.ts`, `src/auth/github-device.ts`, and the custom `gitHttp` client in `src/sync/git-sync.ts`.
 - **All filesystem access must go through the Obsidian `DataAdapter`**, never Node `fs`. `src/sync/fs-adapter.ts` wraps the adapter into the `fs.promises`-shaped object isomorphic-git expects, and is the *only* place that bridges the two worlds.
-- `esbuild.config.mjs` marks `obsidian`, `electron`, all `@codemirror/*`/`@lezer/*`, and Node builtins as `external` — don't import anything that pulls a Node builtin into the runtime path.
+- `esbuild.config.mjs` marks `obsidian`, `electron`, all `@codemirror/*`/`@lezer/*`, and Node builtins as `external` — don't import anything that pulls a Node builtin into the runtime path. **Exception: `buffer` is bundled, not external** — mobile has no Node runtime, so the npm polyfill is bundled and `Buffer` injected as a global via `buffer-shim.mjs` (isomorphic-git's deps `readable-stream`/`sha.js`/`pako`/`crc-32` need it). Removing that exception breaks plugin load on mobile.
 
 ## Architecture
 
@@ -50,8 +50,17 @@ The initial-push/clone/reconnect branching in `initializeRepo` and the retry-saf
 
 `DEFAULT_BRANCH` is `"main"` and the code assumes a single branch everywhere (`singleBranch: true`). There is no rebase — merges are real merge commits via `git.merge`.
 
+### Conflict-merge invariant (preserve this)
+
+A conflicting merge is **not applied until every conflicted path has a resolution**. `sync()` stashes a `PendingMerge {ourHead, theirHead, unresolved, resolutions, deletions}`; `resolveConflict()` fills it in; only when `unresolved` empties does `applyMergeManually()` commit with both parents. Dismissing the modal calls `abandonMerge()`, leaving the repo byte-identical — the next sync re-offers it. Delete/modify conflicts go in `deletions` because isomorphic-git's `mergeDriver` is never consulted for them.
+
+### Debugging on mobile
+
+Mobile has no reachable dev console, so `GitSync.sync()` accumulates a step trace into `SyncResult.logs` and `main.ts` renders it via `showLogModal()` (scrollable + Copy button). Add `log()` calls there rather than `console.log` when diagnosing a mobile-only issue. `GitSync` takes `isExcluded` as a constructor arg — it never reads plugin settings itself.
+
 ## Gotchas
 
-- **CLIENT_ID is injected at build time, not hardcoded.** `esbuild.config.mjs` loads `.env` via `dotenv` and injects `CLIENT_ID` into the bundle with a `define` for `process.env.CLIENT_ID`; `src/constants.ts` reads `process.env.CLIENT_ID`. A real exported env var (CI secret) wins over `.env`. A **production** build (`npm run build`) fails fast if `CLIENT_ID` is empty; a **dev** build (`npm run dev`) is allowed to run without it. To change the OAuth app, edit `.env` (local) or the CI secret — never hardcode it in source. The authorization screen's app name/owner is determined entirely by this `CLIENT_ID`.
+- **The OAuth Client ID is a runtime setting, not a build-time secret.** Each user registers their own GitHub OAuth App (Device Flow enabled) and pastes the Client ID into plugin settings (`settings.clientId`, threaded through `settings-tab.ts` → `requestDeviceCode`). `src/constants.ts` deliberately has no `CLIENT_ID`; the build needs no `.env` or CI secret. Don't reintroduce a build-time inject — see README § "Register a GitHub OAuth App".
 - **Naming is inconsistent.** `package.json`/`PLUGIN_ID`/esbuild banner say `obsidian-multisync`; `manifest.json` id is `git-obsi-sync` (this is the folder name Obsidian uses under `.obsidian/plugins/`, and it must match the manifest id or the plugin fails to load). User-facing name is "Git Sync". Don't "fix" one without checking the others.
-- `excludePatterns` matching supports only `*` as a wildcard (converted to `.*`), anchored full-match — not full glob. Default excludes `.obsidian/workspace*` and per-plugin `data.json`.
+- `excludePatterns` matching supports only `*` as a wildcard (converted to `.*`), anchored full-match — not full glob. The default is exactly one entry, `.obsidian/*`: the whole config dir is unsynced because plugin code, themes, and device-local state differ per device. Only notes & attachments sync.
+- `vaultNameToRepoName()` just slugifies (no `obsidian-` prefix) and is only a **fallback** — `main.ts:122` prefers the user-supplied `settings.repoName`.
