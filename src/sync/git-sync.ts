@@ -187,14 +187,39 @@ export class GitSync {
   /**
    * Clone the remote into the vault directory.
    * Returns true if the clone produced a usable local branch (non-empty remote).
+   *
+   * We clone with `noCheckout` and then check out ONLY the non-excluded paths.
+   * A default `git.clone` checks out the entire remote tree, which overwrites (or
+   * fails on) device-local files the running Obsidian instance has already
+   * written — most notably `.obsidian/*` config the remote happens to track
+   * because another tool committed it. Filtering the checkout keeps the remote's
+   * excluded files out of the working tree entirely; they still exist in HEAD, and
+   * `trackedStatus()`/`checkoutMergedPaths()` keep ignoring them on every later
+   * sync, so they never resurface as spurious deletions.
    */
   async clone(): Promise<boolean> {
     await git.clone({
       ...this.netOpts(),
       singleBranch: true,
       depth: 1,
+      noCheckout: true,
     });
-    return this.hasLocalBranch();
+
+    if (!(await this.hasLocalBranch())) return false;
+
+    const head = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+    const files = await git.listFiles({ fs: this.fs, dir: this.dir, ref: head });
+    const wanted = files.filter((p) => !this.isExcluded(p));
+    if (wanted.length > 0) {
+      await git.checkout({
+        fs: this.fs,
+        dir: this.dir,
+        ref: DEFAULT_BRANCH,
+        force: true,
+        filepaths: wanted,
+      });
+    }
+    return true;
   }
 
   /**
