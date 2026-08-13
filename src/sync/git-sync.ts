@@ -454,11 +454,29 @@ export class GitSync {
 
     const localBranchExists = await this.hasLocalBranch();
     if (!localBranchExists) {
-      // First-ever commit — create it unconditionally so refs/heads/main is written
-      // even when the vault is empty.
-      await git.commit({
+      // On an unborn repository isomorphic-git's short `ref: "main"` can create
+      // an object without establishing refs/heads/main. Create the commit object
+      // first, then explicitly establish both the branch and symbolic HEAD.
+      const initialOid = await git.commit({
         ...this.gitOpts(),
+        ref: DEFAULT_BRANCH,
+        noUpdateBranch: true,
         message: "sync: initial vault snapshot",
+      });
+      await git.writeRef({
+        fs: this.fs,
+        dir: this.dir,
+        ref: `refs/heads/${DEFAULT_BRANCH}`,
+        value: initialOid,
+        force: false,
+      });
+      await git.writeRef({
+        fs: this.fs,
+        dir: this.dir,
+        ref: "HEAD",
+        value: `refs/heads/${DEFAULT_BRANCH}`,
+        force: true,
+        symbolic: true,
       });
     } else {
       // Subsequent call (retry) — only commit if something changed
@@ -467,9 +485,14 @@ export class GitSync {
       if (dirty) {
         await git.commit({
           ...this.gitOpts(),
+          ref: DEFAULT_BRANCH,
           message: "sync: initial vault snapshot",
         });
       }
+    }
+
+    if (!(await this.hasLocalBranch())) {
+      throw new Error(`Initialization failed: could not establish local branch '${DEFAULT_BRANCH}'.`);
     }
 
     // Set up remote (delete+re-add to ensure correct fetch refspec)
@@ -483,11 +506,17 @@ export class GitSync {
       url: this.remoteUrl,
     });
 
-    await git.push({
-      ...this.netOpts(),
-      ref: DEFAULT_BRANCH,
-      force: false,
-    });
+    try {
+      await git.push({
+        ...this.netOpts(),
+        ref: DEFAULT_BRANCH,
+        remoteRef: DEFAULT_BRANCH,
+        force: false,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Initialization created local '${DEFAULT_BRANCH}' but could not push it: ${message}`);
+    }
   }
 
   /**

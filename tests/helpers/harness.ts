@@ -199,3 +199,14 @@ export async function withRemote<T>(seed: Record<string, string | Uint8Array>, f
     await remote.stop();
   }
 }
+
+/** GitHub-create-repository equivalent: the bare remote exists but has no commits. */
+export async function withEmptyRemote<T>(fn: (ctx: { remote: GitHttpRemote; root: string }) => Promise<T>): Promise<T> {
+  const remote = new GitHttpRemote();
+  await remote.start();
+  try {
+    return await fn({ remote, root: remote.root });
+  } finally {
+    await remote.stop();
+  }
+}
