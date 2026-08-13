@@ -1,6 +1,7 @@
 import { SYNC_DEBOUNCE_MS } from "../constants";
 import { GitSync } from "./git-sync";
 import { SyncResult, SyncStatus } from "../types";
+import { normalizeGitPath } from "./paths";
 
 type StatusCallback = (status: SyncStatus, detail?: string) => void;
 
@@ -10,17 +11,43 @@ export class SyncQueue {
   private running = false;
   private gitSync: GitSync;
   private onStatus: StatusCallback;
+  private debounceMs: number;
 
-  constructor(gitSync: GitSync, onStatus: StatusCallback) {
+  constructor(
+    gitSync: GitSync,
+    onStatus: StatusCallback,
+    debounceMs: number = SYNC_DEBOUNCE_MS
+  ) {
     this.gitSync = gitSync;
     this.onStatus = onStatus;
+    this.debounceMs = debounceMs;
   }
 
   /** Enqueue a changed file path. Debounces before triggering sync. */
   enqueue(filepath: string): void {
-    this.pendingFiles.add(filepath);
+    this.pendingFiles.add(normalizeGitPath(filepath));
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    this.debounceTimer = setTimeout(() => this.flush(), SYNC_DEBOUNCE_MS);
+    this.scheduleFlush();
+  }
+
+  /** Update the debounce window, rescheduling any pending flush from now. */
+  setDebounceMs(debounceMs: number): void {
+    this.debounceMs = debounceMs;
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.scheduleFlush();
+    }
+  }
+
+  getDebounceMs(): number {
+    return this.debounceMs;
+  }
+
+  private scheduleFlush(): void {
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      void this.flush();
+    }, this.debounceMs);
   }
 
   /** Immediately drain the queue (used on vault close). */

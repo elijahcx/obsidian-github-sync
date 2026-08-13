@@ -5,6 +5,8 @@ import { StatusBarItem } from "./ui/status-bar";
 import { ConflictModal } from "./ui/conflict-modal";
 import { GitSync } from "./sync/git-sync";
 import { SyncQueue } from "./sync/queue";
+import { enqueueDelete, enqueueRename } from "./sync/events";
+import { normalizeGitPath } from "./sync/paths";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
 
 export default class MultiSyncPlugin extends Plugin {
@@ -79,14 +81,15 @@ export default class MultiSyncPlugin extends Plugin {
       this.app.vault.on("delete", (file: TAbstractFile) => {
         if (!(file instanceof TFile)) return;
         if (!this.syncQueue || !this.settings.autoSync) return;
-        this.syncQueue.enqueue(file.path);
+        enqueueDelete(this.syncQueue, file.path, (path) => this.isExcluded(path));
       })
     );
 
     this.registerEvent(
-      this.app.vault.on("rename", (_file: TAbstractFile, oldPath: string) => {
+      this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+        if (!(file instanceof TFile)) return;
         if (!this.syncQueue || !this.settings.autoSync) return;
-        this.syncQueue.enqueue(oldPath);
+        enqueueRename(this.syncQueue, oldPath, file.path, (path) => this.isExcluded(path));
       })
     );
   }
@@ -195,7 +198,11 @@ export default class MultiSyncPlugin extends Plugin {
         this.settings.lastSyncTime = Date.now();
         this.saveSettings();
       }
-    });
+    }, this.settings.syncIntervalMs);
+  }
+
+  updateSyncIntervalMs(debounceMs: number): void {
+    this.syncQueue?.setDebounceMs(debounceMs);
   }
 
   async triggerManualSync(): Promise<void> {
@@ -245,10 +252,20 @@ export default class MultiSyncPlugin extends Plugin {
     new ConflictModal(
       this.app,
       conflicts,
-      async (filepath, resolved) => {
+      async (filepath, resolved, conflictSessionId) => {
         // Returns true only once EVERY conflict is decided and the merge landed.
-        const merged = await this.gitSync!.resolveConflict(filepath, resolved);
-        if (merged) {
+        const result = await this.gitSync!.resolveConflict(filepath, resolved, conflictSessionId);
+        if (result.stale) {
+          this.setStatus("error", result.message);
+          new Notice(result.message ?? "Conflict is stale. Please sync again.");
+          return;
+        }
+        if (result.conflictFiles?.length) {
+          this.setStatus("conflict");
+          this.showConflictModal(result.conflictFiles);
+          return;
+        }
+        if (result.completed) {
           this.settings.lastSyncTime = Date.now();
           await this.saveSettings();
           this.setStatus("idle");
@@ -258,13 +275,14 @@ export default class MultiSyncPlugin extends Plugin {
       () => {
         // Dismissed without deciding everything: drop the pending merge so the
         // repo stays exactly as it was. The next sync will offer it again.
-        this.gitSync?.abandonMerge();
+        void this.gitSync?.abandonMerge(conflicts[0].conflictSessionId);
         this.setStatus("idle");
       }
     ).open();
   }
 
   private isExcluded(filepath: string): boolean {
+    filepath = normalizeGitPath(filepath);
     return this.settings.excludePatterns.some((pattern) => {
       // Convert simple glob pattern (supports *) to regex
       const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");

@@ -6,14 +6,66 @@ import {
   GIT_AUTHOR_EMAIL,
   DEFAULT_BRANCH,
 } from "../constants";
-import { ConflictFile, SyncResult } from "../types";
+import { ConflictChoice, ConflictFile, ConflictResolutionResult, SyncResult } from "../types";
+import { isSafeRelativePath, isSafeSnapshotBasename, normalizeGitPath, normalizeVaultPath } from "./paths";
+
+const MAX_PUSH_ATTEMPTS = 3;
+let nextConflictSession = 1;
+const RECOVERY_SCHEMA_VERSION = 1;
+const RECOVERY_DIR = ".git/obsidian-sync-recovery";
+
+type RecoveryJournal = {
+  version: 1;
+  operationId: string;
+  operation: "excluded-working-tree";
+  phase: "snapshotted";
+  localHead: string;
+  remoteHead: string;
+  timestamp: string;
+  snapshots: Array<{ path: string; existed: boolean; file?: string }>;
+};
+
+/** A FIFO mutex shared by every GitSync instance using the same vault adapter. */
+class SyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const previous = this.tail;
+    this.tail = new Promise<void>((resolve) => { release = resolve; });
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+}
+
+const vaultMutexes = new WeakMap<DataAdapter, Map<string, SyncMutex>>();
+
+function mutexFor(adapter: DataAdapter, vaultPath: string): SyncMutex {
+  let adapterMutexes = vaultMutexes.get(adapter);
+  if (!adapterMutexes) {
+    adapterMutexes = new Map();
+    vaultMutexes.set(adapter, adapterMutexes);
+  }
+
+  let mutex = adapterMutexes.get(vaultPath);
+  if (!mutex) {
+    mutex = new SyncMutex();
+    adapterMutexes.set(vaultPath, mutex);
+  }
+  return mutex;
+}
 
 // Custom HTTP client that uses Obsidian's requestUrl (mobile-safe, bypasses CORS)
 const gitHttp = {
   async request({ url, method, headers, body }: {
     url: string;
-    method: string;
-    headers: Record<string, string>;
+    method?: string;
+    headers?: Record<string, string>;
     body?: AsyncIterableIterator<Uint8Array>;
   }) {
     let bodyBuffer: ArrayBuffer | undefined;
@@ -29,8 +81,8 @@ const gitHttp = {
 
     const response = await requestUrl({
       url,
-      method,
-      headers,
+      method: method ?? "GET",
+      headers: headers ?? {},
       body: bodyBuffer,
       throw: false,
     });
@@ -57,17 +109,21 @@ const gitHttp = {
  * leaves the repo exactly as it was.
  */
 type PendingMerge = {
+  sessionId: string;
   ourHead: string;
   theirHead: string;
   /** Conflicted paths still awaiting a user decision. */
   unresolved: Set<string>;
   /** path → the content the user chose to keep. */
-  resolutions: Map<string, string>;
+  resolutions: Map<string, ConflictChoice>;
   /**
    * Paths conflicting because one side DELETED the file. isomorphic-git's
    * mergeDriver is never consulted for these, so they need the manual path.
    */
   deletions: Set<string>;
+  /** Excluded conflicts resolved automatically from the remote commit tree. */
+  excludedResolutions: Set<string>;
+  binaryConflicts: Set<string>;
 };
 
 export class GitSync {
@@ -76,6 +132,8 @@ export class GitSync {
   private token: string;
   private username: string;
   private remoteUrl: string;
+  private mutex: SyncMutex;
+  private readonly conflictSessionEpoch = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   /** Set when sync() hits real merge conflicts; consumed by resolveConflict(). */
   private pendingMerge: PendingMerge | null = null;
   /** Paths the user excluded from sync; never staged, never treated as conflicts. */
@@ -89,12 +147,14 @@ export class GitSync {
     repoName: string,
     isExcluded: (filepath: string) => boolean = () => false
   ) {
-    this.fs = createFsAdapter(adapter, vaultPath);
-    this.dir = vaultPath;
+    const normalizedVaultPath = normalizeVaultPath(vaultPath);
+    this.fs = createFsAdapter(adapter, normalizedVaultPath);
+    this.dir = normalizedVaultPath;
     this.token = token;
     this.username = username;
     this.remoteUrl = `https://github.com/${username}/${repoName}.git`;
-    this.isExcluded = isExcluded;
+    this.isExcluded = (filepath) => isExcluded(normalizeGitPath(filepath));
+    this.mutex = mutexFor(adapter, normalizedVaultPath);
   }
 
   /** Base options shared by ALL git operations (local and network) */
@@ -131,6 +191,15 @@ export class GitSync {
   async isInitialized(): Promise<boolean> {
     try {
       await git.resolveRef({ fs: this.fs, dir: this.dir, ref: "HEAD" });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async hasGitDirectory(): Promise<boolean> {
+    try {
+      await this.fs.promises.stat(this.repoPath(".git"));
       return true;
     } catch {
       return false;
@@ -184,6 +253,81 @@ export class GitSync {
   /** Set by safeFetch when a fetch attempt throws; read by sync() for logging. */
   private lastFetchError: string | null = null;
 
+  private repoPath(path: string): string {
+    return this.dir ? `${this.dir}/${path}` : path;
+  }
+
+  private async recoverInterruptedOperation(): Promise<void> {
+    const journalPath = this.repoPath(`${RECOVERY_DIR}/journal.json`);
+    let raw: string;
+    try {
+      raw = String(await this.fs.promises.readFile(journalPath, "utf8"));
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return;
+      throw error;
+    }
+
+    let journal: RecoveryJournal;
+    try {
+      journal = JSON.parse(raw) as RecoveryJournal;
+    } catch {
+      throw new Error(`Sync recovery journal is corrupted at ${RECOVERY_DIR}/journal.json; user files were not changed.`);
+    }
+    if (
+      journal.version !== RECOVERY_SCHEMA_VERSION ||
+      journal.operation !== "excluded-working-tree" ||
+      journal.phase !== "snapshotted" ||
+      !Array.isArray(journal.snapshots)
+    ) {
+      throw new Error(`Unsupported sync recovery journal at ${RECOVERY_DIR}/journal.json; user files were not changed.`);
+    }
+
+    // Validate every entry and load every referenced snapshot before changing a
+    // single vault file. Recovery metadata is untrusted even though it lives in
+    // .git; adapter path containment is never relied upon.
+    const validated: Array<{ path: string; existed: boolean; data?: Buffer }> = [];
+    for (const snapshot of journal.snapshots) {
+      if (!snapshot || typeof snapshot !== "object" || !isSafeRelativePath(snapshot.path)) {
+        throw new Error("Unsafe recovery journal path; user files were not changed.");
+      }
+      const filepath = snapshot.path;
+      if (!this.isExcluded(filepath) || typeof snapshot.existed !== "boolean") {
+        throw new Error(`Unsafe recovery journal path '${filepath}'; user files were not changed.`);
+      }
+      let data: Buffer | undefined;
+      if (snapshot.existed) {
+        if (!isSafeSnapshotBasename(snapshot.file)) {
+          throw new Error(`Unsafe recovery snapshot filename for '${filepath}'; user files were not changed.`);
+        }
+        data = Buffer.from(await this.fs.promises.readFile(this.repoPath(`${RECOVERY_DIR}/${snapshot.file}`)) as Buffer);
+      } else if (snapshot.file !== undefined) {
+        throw new Error(`Unexpected recovery snapshot filename for '${filepath}'; user files were not changed.`);
+      }
+      validated.push({ path: filepath, existed: snapshot.existed, data });
+    }
+
+    // Restoration is deliberately the only automatic recovery action. Git refs
+    // are left untouched; the next fetch/merge observes actual repository state.
+    for (const snapshot of validated) {
+      if (snapshot.existed) await this.fs.promises.writeFile(this.repoPath(snapshot.path), snapshot.data!);
+      else await this.fs.promises.unlink(this.repoPath(snapshot.path));
+    }
+    await this.clearRecoveryJournal(journal);
+    this.pendingMerge = null;
+  }
+
+  private async clearRecoveryJournal(journal: RecoveryJournal): Promise<void> {
+    // Remove the authoritative marker first. A crash during subsequent cleanup
+    // can leave harmless orphan snapshot blobs, but can never leave a journal
+    // that points at a snapshot already deleted by cleanup.
+    await this.fs.promises.unlink(this.repoPath(`${RECOVERY_DIR}/journal.json`));
+    for (const snapshot of journal.snapshots) {
+      if (isSafeSnapshotBasename(snapshot.file)) {
+        await this.fs.promises.unlink(this.repoPath(`${RECOVERY_DIR}/${snapshot.file}`));
+      }
+    }
+  }
+
   /**
    * Clone the remote into the vault directory.
    * Returns true if the clone produced a usable local branch (non-empty remote).
@@ -198,18 +342,67 @@ export class GitSync {
    * sync, so they never resurface as spurious deletions.
    */
   async clone(): Promise<boolean> {
-    await git.clone({
-      ...this.netOpts(),
-      singleBranch: true,
-      depth: 1,
-      noCheckout: true,
+    return this.mutex.run(async () => {
+      await this.recoverInterruptedOperation();
+      return this.cloneUnlocked();
     });
+  }
+
+  private async cloneUnlocked(): Promise<boolean> {
+    if (await this.hasGitDirectory()) {
+      // A terminated no-checkout clone may leave .git present but no local
+      // branch. Fetch the actual remote and safely finish local setup instead of
+      // deleting either the repository or user working files.
+      if (!(await this.hasLocalBranch())) {
+        try {
+          await git.deleteRemote({ fs: this.fs, dir: this.dir, remote: "origin" });
+        } catch { /* partial setup may not have written the remote yet */ }
+        await git.addRemote({
+          fs: this.fs,
+          dir: this.dir,
+          remote: "origin",
+          url: this.remoteUrl,
+        });
+        const fetchResult = await git.fetch({
+          ...this.netOpts(),
+          ref: DEFAULT_BRANCH,
+          singleBranch: true,
+          depth: 1,
+        });
+        const fetched = fetchResult.fetchHead ?? null;
+        if (!fetched) return false;
+        await git.writeRef({
+          fs: this.fs,
+          dir: this.dir,
+          ref: `refs/heads/${DEFAULT_BRANCH}`,
+          value: fetched,
+          force: false,
+        });
+      }
+    } else {
+      await git.clone({
+        ...this.netOpts(),
+        singleBranch: true,
+        depth: 1,
+        noCheckout: true,
+      });
+    }
 
     if (!(await this.hasLocalBranch())) return false;
 
     const head = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
     const files = await git.listFiles({ fs: this.fs, dir: this.dir, ref: head });
     const wanted = files.filter((p) => !this.isExcluded(p));
+    const collisions: string[] = [];
+    for (const filepath of wanted) {
+      const local = await this.readWorkingFileIfPresent(filepath);
+      if (!local) continue;
+      const remote = await this.readBlobBytesAt(head, filepath);
+      if (!remote.exists || !Buffer.from(local).equals(Buffer.from(remote.content))) collisions.push(filepath);
+    }
+    if (collisions.length > 0) {
+      throw new Error(`Clone stopped to preserve differing local file(s): ${collisions.join(", ")}`);
+    }
     if (wanted.length > 0) {
       await git.checkout({
         fs: this.fs,
@@ -222,18 +415,36 @@ export class GitSync {
     return true;
   }
 
+  private async readWorkingFileIfPresent(filepath: string): Promise<Buffer | null> {
+    try {
+      return Buffer.from(await this.fs.promises.readFile(this.repoPath(filepath)) as Buffer);
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
   /**
    * First-time setup: init locally (if needed), commit everything, push.
    * Safe to call on a partially-initialised repo (retry after failure).
    */
   async initAndPush(vaultFiles: string[]): Promise<void> {
+    return this.mutex.run(async () => {
+      await this.recoverInterruptedOperation();
+      return this.initAndPushUnlocked(vaultFiles);
+    });
+  }
+
+  private async initAndPushUnlocked(vaultFiles: string[]): Promise<void> {
     const alreadyInited = await this.isInitialized();
     if (!alreadyInited) {
       await git.init({ fs: this.fs, dir: this.dir, defaultBranch: DEFAULT_BRANCH });
     }
 
     // Stage all vault files (skip any that fail)
-    for (const file of vaultFiles) {
+    for (const inputFile of vaultFiles) {
+      const file = normalizeGitPath(inputFile);
+      if (this.isExcluded(file)) continue;
       try {
         await git.add({ fs: this.fs, dir: this.dir, filepath: file });
       } catch {
@@ -292,6 +503,13 @@ export class GitSync {
    * commit for diverged histories, so remote work is never dropped.
    */
   async sync(changedFiles: string[]): Promise<SyncResult> {
+    return this.mutex.run(async () => {
+      await this.recoverInterruptedOperation();
+      return this.syncUnlocked(changedFiles);
+    });
+  }
+
+  private async syncUnlocked(changedFiles: string[]): Promise<SyncResult> {
     const logs: string[] = [];
     const log = (m: string) => { logs.push(m); console.log(`[git-sync] ${m}`); };
     const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
@@ -300,7 +518,8 @@ export class GitSync {
 
     try {
       // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
-      for (const file of changedFiles) {
+      for (const inputFile of changedFiles) {
+        const file = normalizeGitPath(inputFile);
         if (this.isExcluded(file)) continue;
         try {
           await git.add({ fs: this.fs, dir: this.dir, filepath: file });
@@ -334,23 +553,23 @@ export class GitSync {
       this.lastFetchError = null;
       const fetchHead = await this.safeFetch();
       log(`step2 fetchHead=${short(fetchHead)}`);
-      if (fetchHead === null && this.lastFetchError) log(`step2 ${this.lastFetchError}`);
+      if (fetchHead === null && this.lastFetchError) {
+        log(`step2 ${this.lastFetchError}`);
+        throw new Error(this.lastFetchError);
+      }
 
-      const conflicts = await this.mergeRemote(fetchHead, log);
+      const dirtyAfterFetch = (await this.trackedStatus())
+        .filter(([, head, workdir]) => workdir !== head)
+        .map(([filepath]) => filepath);
+      if (dirtyAfterFetch.length > 0) {
+        throw new Error(`Local files changed during sync; retrying is required: ${dirtyAfterFetch.join(", ")}`);
+      }
+
+      let conflicts = await this.mergeRemote(fetchHead, log);
 
       // ── 3. Push ─────────────────────────────────────────────────────────────
       if (conflicts.length === 0 && (await this.hasLocalBranch())) {
-        // Only push if local is actually ahead of the remote-tracking ref.
-        const localHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
-        let remoteHead: string | null = null;
-        try { remoteHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }); } catch { /* no remote ref yet */ }
-        if (localHead !== remoteHead) {
-          log(`step3 pushing local=${short(localHead)} remote=${short(remoteHead)}`);
-          const pushRes = await git.push({ ...this.netOpts(), ref: DEFAULT_BRANCH });
-          log(`step3 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
-        } else {
-          log(`step3 nothing to push (local == remote)`);
-        }
+        conflicts = await this.pushWithRetry(log, short);
       }
 
       log(`sync() OK conflicts=${conflicts.length}`);
@@ -360,6 +579,79 @@ export class GitSync {
       log(`sync() FAILED: ${msg}`);
       return { success: false, conflictFiles: [], error: msg, logs };
     }
+  }
+
+  /**
+   * Push local main, retrying only when GitHub rejects the push because the
+   * remote advanced after our last fetch. Each retry fetches the latest remote,
+   * merges it through the same conflict-safe merge path, and then attempts a
+   * normal non-forced push again.
+   */
+  private async pushWithRetry(
+    log: (m: string) => void,
+    short: (oid: string | null) => string
+  ): Promise<ConflictFile[]> {
+    let attempt = 1;
+
+    while (attempt <= MAX_PUSH_ATTEMPTS) {
+      const localHead = await git.resolveRef({
+        fs: this.fs,
+        dir: this.dir,
+        ref: DEFAULT_BRANCH,
+      });
+      let remoteHead: string | null = null;
+      try {
+        remoteHead = await git.resolveRef({
+          fs: this.fs,
+          dir: this.dir,
+          ref: `refs/remotes/origin/${DEFAULT_BRANCH}`,
+        });
+      } catch {
+        /* no remote ref yet */
+      }
+
+      if (localHead === remoteHead) {
+        log(`step3 nothing to push (local == remote)`);
+        return [];
+      }
+
+      try {
+        log(`step3 pushing attempt=${attempt} local=${short(localHead)} remote=${short(remoteHead)}`);
+        const pushRes = await git.push({ ...this.netOpts(), ref: DEFAULT_BRANCH, force: false });
+        log(`step3 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
+        return [];
+      } catch (e) {
+        if (!this.isNonFastForwardPushError(e) || attempt >= MAX_PUSH_ATTEMPTS) {
+          throw e;
+        }
+
+        const msg = e instanceof Error ? e.message : String(e);
+        log(`step3 non-fast-forward on attempt=${attempt}: ${msg}`);
+        this.lastFetchError = null;
+        const latest = await this.safeFetch();
+        log(`step3 retry fetchHead=${short(latest)}`);
+        if (latest === null) {
+          if (this.lastFetchError) log(`step3 ${this.lastFetchError}`);
+          throw e;
+        }
+
+        const conflicts = await this.mergeRemote(latest, log);
+        if (conflicts.length > 0) return conflicts;
+        attempt++;
+      }
+    }
+
+    return [];
+  }
+
+  /** True only for push rejections that should be solved by fetch/merge/retry. */
+  private isNonFastForwardPushError(error: unknown): boolean {
+    const code = (error as { code?: string })?.code ?? "";
+    const msg = error instanceof Error ? error.message : String(error);
+    return (
+      code === "PushRejectedError" ||
+      /not a simple fast-forward|non-fast-forward|fetch first|rejected/i.test(msg)
+    );
   }
 
 
@@ -414,48 +706,66 @@ export class GitSync {
       const err = e as { code?: string; data?: { filepaths?: string[]; deleteByUs?: string[]; deleteByTheirs?: string[] } };
       if (err.code !== "MergeConflictError") throw e;
 
-      const paths = (err.data?.filepaths ?? []).filter((p) => !this.isExcluded(p));
+      const allPaths = err.data?.filepaths ?? [];
+      const paths = allPaths.filter((p) => !this.isExcluded(p));
+      const excludedPaths = new Set(allPaths.filter((p) => this.isExcluded(p)));
       log(`step2 conflicts=${paths.length} ${JSON.stringify(paths)}`);
       if (paths.length === 0) {
-        // Every conflict was in an excluded path — nothing the user should see.
-        // We cannot merge automatically, so leave the repo as-is and report clean.
-        log(`step2 all conflicts excluded; skipping merge`);
+        // Preserve the remote version in the merge commit while restoring the
+        // device-local working copy after the index/commit work is complete.
+        await this.withExcludedWorkingTreeProtected(ourHead, fetchHead, async () => {
+          await this.applyMergeManually(ourHead, fetchHead, new Map(), excludedPaths);
+        });
+        log(`step2 auto-resolved ${excludedPaths.size} excluded conflict(s) from remote tree`);
         return [];
       }
 
       const deletions = new Set(
-        [...(err.data?.deleteByUs ?? []), ...(err.data?.deleteByTheirs ?? [])].filter(
-          (p) => !this.isExcluded(p)
-        )
+        [...(err.data?.deleteByUs ?? []), ...(err.data?.deleteByTheirs ?? [])]
       );
 
       this.pendingMerge = {
+        sessionId: `conflict-${this.conflictSessionEpoch}-${nextConflictSession++}`,
         ourHead,
         theirHead: fetchHead,
         unresolved: new Set(paths),
         resolutions: new Map(),
         deletions,
+        excludedResolutions: excludedPaths,
+        binaryConflicts: new Set(),
       };
 
       const conflicts: ConflictFile[] = [];
       for (const p of paths) {
+        const ours = await this.readBlobBytesAt(ourHead, p);
+        const theirs = await this.readBlobBytesAt(fetchHead, p);
+        const isBinary = this.isBinaryContent(ours.content) || this.isBinaryContent(theirs.content);
+        if (isBinary) this.pendingMerge.binaryConflicts.add(p);
         conflicts.push({
+          conflictSessionId: this.pendingMerge.sessionId,
           path: p,
-          ours: await this.readBlobAt(ourHead, p),
-          theirs: await this.readBlobAt(fetchHead, p),
+          ours: isBinary ? "" : new TextDecoder().decode(ours.content),
+          theirs: isBinary ? "" : new TextDecoder().decode(theirs.content),
+          oursExists: ours.exists,
+          theirsExists: theirs.exists,
+          isBinary,
+          oursBytes: isBinary ? Array.from(ours.content) : undefined,
+          theirsBytes: isBinary ? Array.from(theirs.content) : undefined,
         });
       }
       return conflicts;
     }
 
     // No conflicts — apply the merge for real, then materialise it on disk.
-    await git.merge({
-      ...this.gitOpts(),
-      ours: DEFAULT_BRANCH,
-      theirs: fetchHead,
-      message: "sync: merge remote changes",
-      fastForwardOnly: false,
-      abortOnConflict: true,
+    await this.withExcludedWorkingTreeProtected(ourHead, fetchHead, async () => {
+      await git.merge({
+        ...this.gitOpts(),
+        ours: DEFAULT_BRANCH,
+        theirs: fetchHead,
+        message: "sync: merge remote changes",
+        fastForwardOnly: false,
+        abortOnConflict: true,
+      });
     });
     await this.checkoutMergedPaths(ourHead, log);
     return [];
@@ -500,7 +810,9 @@ export class GitSync {
       });
       log(`step2 checked out ${changed.length} merged path(s)`);
     } catch (e) {
-      log(`step2 checkout skipped: ${e instanceof Error ? e.message : String(e)}`);
+      const message = `step2 checkout failed: ${e instanceof Error ? e.message : String(e)}`;
+      log(message);
+      throw new Error(message);
     }
   }
 
@@ -512,25 +824,63 @@ export class GitSync {
    * isomorphic-git. That preserves the remote's non-conflicting changes — hand-
    * building the commit from the index would silently drop them.
    *
-   * Returns true when the merge was completed and pushed.
+   * Returns a structured result so stale UI sessions cannot mutate the repo.
    */
-  async resolveConflict(filepath: string, resolvedContent: string): Promise<boolean> {
+  async resolveConflict(
+    filepath: string,
+    resolvedContent: ConflictChoice | string,
+    conflictSessionId: string
+  ): Promise<ConflictResolutionResult> {
+    const gitPath = normalizeGitPath(filepath);
+    return this.mutex.run(async () => {
+      await this.recoverInterruptedOperation();
+      return this.resolveConflictUnlocked(gitPath, resolvedContent, conflictSessionId);
+    });
+  }
+
+  private async resolveConflictUnlocked(
+    filepath: string,
+    resolvedContent: ConflictChoice | string,
+    conflictSessionId: string
+  ): Promise<ConflictResolutionResult> {
     const pending = this.pendingMerge;
     if (!pending) {
-      // No merge in flight — just save the file and let the next sync handle it.
-      await this.fs.promises.writeFile(`${this.dir}/${filepath}`, resolvedContent);
-      return false;
+      return {
+        completed: false,
+        stale: true,
+        message: "This conflict is no longer active. Please sync again to refresh conflicts.",
+      };
     }
 
-    pending.resolutions.set(filepath, resolvedContent);
+    if (conflictSessionId !== pending.sessionId) {
+      return {
+        completed: false,
+        stale: true,
+        message: "This conflict session is stale. Please reopen the latest conflict prompt.",
+      };
+    }
+
+    if (!(await this.isPendingMergeCurrent(pending))) {
+      this.pendingMerge = null;
+      return {
+        completed: false,
+        stale: true,
+        message: "Repository state changed while this conflict was open. Please sync again.",
+      };
+    }
+
+    const choice: ConflictChoice = typeof resolvedContent === "string"
+      ? { exists: true, content: resolvedContent }
+      : resolvedContent;
+    pending.resolutions.set(filepath, choice);
     pending.unresolved.delete(filepath);
-    if (pending.unresolved.size > 0) return false;
+    if (pending.unresolved.size > 0) return { completed: false, stale: false };
 
     // All decisions in — replay the merge, injecting the chosen content.
-    const { ourHead, theirHead, resolutions, deletions } = pending;
+    const { ourHead, theirHead, resolutions, deletions, excludedResolutions, binaryConflicts } = pending;
     this.pendingMerge = null;
 
-    if (deletions.size === 0) {
+    if (deletions.size === 0 && excludedResolutions.size === 0 && binaryConflicts.size === 0) {
       // Content-only conflicts: let isomorphic-git build the merge tree via the
       // merge driver. This keeps the remote's non-conflicting changes intact.
       await git.merge({
@@ -543,7 +893,7 @@ export class GitSync {
         mergeDriver: ({ path: p, contents }) => {
           const chosen = resolutions.get(p);
           return chosen !== undefined
-            ? { cleanMerge: true, mergedText: chosen }
+            ? { cleanMerge: true, mergedText: String(chosen.content) }
             : { cleanMerge: false, mergedText: contents[1] };
         },
       });
@@ -553,11 +903,38 @@ export class GitSync {
       // merge with conflict markers, overwrite each decided path, then commit a
       // real two-parent merge. Staging is restricted to paths tracked by either
       // side so untracked/excluded files are never swept in.
-      await this.applyMergeManually(ourHead, theirHead, resolutions);
+      await this.withExcludedWorkingTreeProtected(ourHead, theirHead, async () => {
+        await this.applyMergeManually(ourHead, theirHead, resolutions, excludedResolutions);
+      });
     }
 
-    await git.push({ ...this.netOpts(), ref: DEFAULT_BRANCH });
-    return true;
+    // The remote may have advanced while the conflict modal was open. Reuse the
+    // normal bounded fetch/merge/push discipline rather than doing a one-shot
+    // push. mergeRemote() creates a fresh pending session if that retry reveals
+    // another conflict; the session resolved above has already been cleared.
+    const log = (message: string) => console.log(`[git-sync] ${message}`);
+    const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
+    const conflicts = await this.pushWithRetry(log, short);
+    if (conflicts.length > 0) {
+      return { completed: false, stale: false, conflictFiles: conflicts };
+    }
+    return { completed: true, stale: false };
+  }
+
+  private async isPendingMergeCurrent(pending: PendingMerge): Promise<boolean> {
+    try {
+      const currentHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+      if (currentHead !== pending.ourHead) return false;
+
+      const currentRemote = await git.resolveRef({
+        fs: this.fs,
+        dir: this.dir,
+        ref: `refs/remotes/origin/${DEFAULT_BRANCH}`,
+      });
+      return currentRemote === pending.theirHead;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -570,7 +947,8 @@ export class GitSync {
   private async applyMergeManually(
     ourHead: string,
     theirHead: string,
-    resolutions: Map<string, string>
+    resolutions: Map<string, ConflictChoice>,
+    excludedResolutions: Set<string> = new Set()
   ): Promise<void> {
     try {
       await git.merge({
@@ -586,13 +964,29 @@ export class GitSync {
     }
 
     // Apply the user's decision for every conflicted path.
-    for (const [filepath, content] of resolutions) {
-      // An empty choice means the file did not exist on the chosen side —
-      // honour that as a deletion rather than writing a zero-byte file.
-      if (content === "") {
+    for (const [filepath, choice] of resolutions) {
+      if (!choice.exists) {
         await this.fs.promises.unlink(`${this.dir}/${filepath}`);
       } else {
-        await this.fs.promises.writeFile(`${this.dir}/${filepath}`, content);
+        await this.fs.promises.writeFile(`${this.dir}/${filepath}`, choice.content);
+      }
+    }
+
+    // Excluded conflicts never require a user decision. Put the remote side in
+    // the index/merge tree, then restore the device-local working copy after the
+    // merge commit via withExcludedWorkingTreeProtected().
+    for (const filepath of excludedResolutions) {
+      if (await this.blobOidAt(theirHead, filepath)) {
+        await git.checkout({
+          fs: this.fs,
+          dir: this.dir,
+          ref: theirHead,
+          filepaths: [filepath],
+          force: true,
+        });
+        await git.add({ fs: this.fs, dir: this.dir, filepath });
+      } else {
+        await git.remove({ fs: this.fs, dir: this.dir, filepath });
       }
     }
 
@@ -603,26 +997,95 @@ export class GitSync {
     ]);
     for (const [filepath, head, workdir, stage] of await this.trackedStatus()) {
       if (!tracked.has(filepath)) continue;
-      try {
-        if (workdir === 0) {
-          await git.remove({ fs: this.fs, dir: this.dir, filepath });
-        } else if (stage !== head || workdir !== head || stage === 3) {
-          await git.add({ fs: this.fs, dir: this.dir, filepath });
-        }
-      } catch { /* leave undecidable paths to the next sync */ }
+      if (workdir === 0) {
+        await git.remove({ fs: this.fs, dir: this.dir, filepath });
+      } else if (stage !== head || workdir !== head || stage === 3) {
+        await git.add({ fs: this.fs, dir: this.dir, filepath });
+      }
+    }
+    const unresolved = (await git.statusMatrix({ fs: this.fs, dir: this.dir }))
+      .filter(([filepath, , , stage]) => tracked.has(filepath) && !this.isExcluded(filepath) && stage === 3)
+      .map(([filepath]) => filepath);
+    if (unresolved.length > 0) {
+      throw new Error(`Cannot create merge commit with unresolved paths: ${unresolved.join(", ")}`);
     }
 
     await git.commit({
       ...this.gitOpts(),
+      ref: DEFAULT_BRANCH,
       message: "sync: merge remote changes (conflicts resolved)",
       parent: [ourHead, theirHead],
     });
     await this.checkoutMergedPaths(ourHead, () => {});
   }
 
+  /** Keep excluded working files byte-for-byte local while Git advances its tree. */
+  private async withExcludedWorkingTreeProtected<T>(
+    ourHead: string,
+    theirHead: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const tracked = new Set([
+      ...(await git.listFiles({ fs: this.fs, dir: this.dir, ref: ourHead })),
+      ...(await git.listFiles({ fs: this.fs, dir: this.dir, ref: theirHead })),
+    ]);
+    const excludedTracked = [...tracked].filter((filepath) => this.isExcluded(filepath));
+    if (excludedTracked.length === 0) return operation();
+    const operationId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const journal: RecoveryJournal = {
+      version: RECOVERY_SCHEMA_VERSION,
+      operationId,
+      operation: "excluded-working-tree",
+      phase: "snapshotted",
+      localHead: ourHead,
+      remoteHead: theirHead,
+      timestamp: new Date().toISOString(),
+      snapshots: [],
+    };
+    await this.fs.promises.mkdir(this.repoPath(RECOVERY_DIR), { recursive: true });
+    for (const filepath of excludedTracked) {
+      try {
+        const data = await this.fs.promises.readFile(this.repoPath(filepath));
+        const file = `${operationId}-${journal.snapshots.length}.bin`;
+        await this.fs.promises.writeFile(this.repoPath(`${RECOVERY_DIR}/${file}`), data as Buffer);
+        journal.snapshots.push({ path: filepath, existed: true, file });
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error;
+        journal.snapshots.push({ path: filepath, existed: false });
+      }
+    }
+
+    // Snapshots reach durable device-local storage before the journal makes the
+    // operation recoverable and before Git may touch an excluded path.
+    await this.fs.promises.writeFile(
+      this.repoPath(`${RECOVERY_DIR}/journal.json`),
+      JSON.stringify(journal)
+    );
+
+    try {
+      return await operation();
+    } finally {
+      for (const snapshot of journal.snapshots) {
+        if (!snapshot.existed) await this.fs.promises.unlink(this.repoPath(snapshot.path));
+        else {
+          const data = await this.fs.promises.readFile(
+            this.repoPath(`${RECOVERY_DIR}/${snapshot.file!}`)
+          );
+          await this.fs.promises.writeFile(this.repoPath(snapshot.path), data as Buffer);
+        }
+      }
+      await this.clearRecoveryJournal(journal);
+    }
+  }
+
   /** Discard an in-flight merge (user dismissed the conflict modal). */
-  abandonMerge(): void {
-    this.pendingMerge = null;
+  async abandonMerge(conflictSessionId: string): Promise<void> {
+    await this.mutex.run(async () => {
+      await this.recoverInterruptedOperation();
+      if (this.pendingMerge?.sessionId === conflictSessionId) {
+        this.pendingMerge = null;
+      }
+    });
   }
 
   /**
@@ -632,21 +1095,44 @@ export class GitSync {
    * conflicting merge leaves the repo untouched until the user decides.
    */
   async pull(): Promise<ConflictFile[]> {
+    return this.mutex.run(async () => {
+      await this.recoverInterruptedOperation();
+      return this.pullUnlocked();
+    });
+  }
+
+  private async pullUnlocked(): Promise<ConflictFile[]> {
     if (!(await this.hasLocalBranch())) return [];
 
+    this.lastFetchError = null;
     const fetchHead = await this.safeFetch();
-    if (!fetchHead) return [];
+    if (!fetchHead) {
+      if (this.lastFetchError) throw new Error(this.lastFetchError);
+      return [];
+    }
 
     return this.mergeRemote(fetchHead, (m) => console.log(`[git-sync] ${m}`));
   }
 
-  /** Contents of `filepath` as of commit `oid`, or "" when absent (deleted there). */
-  private async readBlobAt(oid: string, filepath: string): Promise<string> {
+  private async readBlobBytesAt(
+    oid: string,
+    filepath: string
+  ): Promise<{ exists: boolean; content: Uint8Array }> {
     try {
       const { blob } = await git.readBlob({ fs: this.fs, dir: this.dir, oid, filepath });
-      return new TextDecoder().decode(blob);
+      return { exists: true, content: blob };
     } catch {
-      return "";
+      return { exists: false, content: new Uint8Array() };
+    }
+  }
+
+  private isBinaryContent(content: Uint8Array): boolean {
+    if (content.includes(0)) return true;
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(content);
+      return false;
+    } catch {
+      return true;
     }
   }
 

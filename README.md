@@ -337,6 +337,40 @@ Example — exclude all files in a `Private` folder:
 Private/*
 ```
 
+If an excluded path was committed before it was excluded, the plugin keeps the
+remote version in Git history but never checks it out over the device-local copy.
+To stop tracking such paths in future commits without rewriting history, run this
+once from a desktop clone and push the resulting commit:
+
+```bash
+git rm -r --cached -- .obsidian
+git commit -m "chore: stop tracking device-local Obsidian files"
+git push origin main
+```
+
+`--cached` removes the paths only from Git's current tree; it leaves the local
+files on disk. Adjust `.obsidian` to the excluded path you want to untrack.
+
+### Cross-platform filename notes
+
+Git paths are stored with forward slashes on every platform, while the Obsidian
+adapter handles native filesystem paths. Case-only renames work when the host
+filesystem exposes both names distinctly. Because common macOS and Windows
+volumes are case-insensitive, perform case-only renames through an intermediate
+name (for example `note.md` → `note.tmp` → `Note.md`) if Obsidian does not emit the
+rename directly. CI runs on a case-sensitive Linux filesystem, so native macOS,
+Windows, and iOS filesystem-provider behavior still requires real-device testing.
+
+### Interrupted-operation recovery
+
+Before a merge can temporarily touch a historically tracked excluded file, the
+plugin stores a device-local snapshot and versioned journal under
+`.git/obsidian-sync-recovery/`. The next clone, sync, pull, or conflict action
+restores those local files before inspecting the current Git refs. This recovery
+area is Git metadata and is never committed or pushed. If its journal is damaged
+or from an unsupported future version, synchronization stops without changing
+vault files and reports that manual recovery is required.
+
 ---
 
 ## Troubleshooting

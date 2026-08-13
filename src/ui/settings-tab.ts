@@ -114,6 +114,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (val) => {
             settings.syncIntervalMs = val;
+            this.plugin.updateSyncIntervalMs(val);
             await this.plugin.saveSettings();
           })
       );

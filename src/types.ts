@@ -59,9 +59,27 @@ export type SyncStatus =
   | "connecting";
 
 export interface ConflictFile {
+  conflictSessionId: string; // unique token for the merge/conflict state that produced this file
   path: string;
   ours: string;   // local file content
   theirs: string; // remote file content
+  oursExists: boolean;
+  theirsExists: boolean;
+  isBinary: boolean;
+  oursBytes?: number[];
+  theirsBytes?: number[];
+}
+
+export interface ConflictChoice {
+  exists: boolean;
+  content: string | Uint8Array;
+}
+
+export interface ConflictResolutionResult {
+  completed: boolean; // true once every conflict in the active session has been resolved and pushed
+  stale: boolean;     // true when the UI is resolving an old conflict session
+  conflictFiles?: ConflictFile[]; // new conflicts found while retrying the resolved merge's push
+  message?: string;
 }
 
 export interface SyncResult {

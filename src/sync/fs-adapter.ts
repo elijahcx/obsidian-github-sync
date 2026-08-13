@@ -1,4 +1,5 @@
 import { DataAdapter } from "obsidian";
+import { normalizeGitPath, normalizeVaultPath } from "./paths";
 
 type Stats = {
   type: "file" | "dir";
@@ -22,11 +23,11 @@ type Stats = {
  * We strip the vaultPath prefix before calling Obsidian's adapter (which uses relative paths).
  */
 export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
+  const base = normalizeVaultPath(vaultPath);
   /** Strip the vault root prefix so Obsidian adapter gets relative paths */
   function rel(absPath: string): string {
-    const normalized = absPath.replace(/\\/g, "/");
-    const base = vaultPath.replace(/\\/g, "/").replace(/\/$/, "");
-    if (base === "") return normalized.replace(/^\//, "");
+    const normalized = normalizeVaultPath(absPath);
+    if (base === "") return normalizeGitPath(normalized);
     // The vault root itself (absPath === base) must map to "", not to `base`.
     // Otherwise adapter.list(base) looks for a subfolder literally named after
     // the vault dir, fails, and isomorphic-git sees an EMPTY working tree — every
@@ -34,9 +35,9 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     // commits that never merge/pull. This is the mobile-only root-dir case.
     if (normalized === base) return "";
     if (normalized.startsWith(base + "/")) {
-      return normalized.slice(base.length + 1);
+      return normalizeGitPath(normalized.slice(base.length + 1));
     }
-    return normalized;
+    return normalizeGitPath(normalized);
   }
 
   const promises = {
@@ -58,7 +59,15 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
           return Buffer.from(content).toString("utf8");
         }
         return Buffer.from(content);
-      } catch {
+      } catch (cause) {
+        // Only claim ENOENT when the adapter can positively prove absence.
+        // Permission/provider/transient failures must remain distinguishable.
+        try {
+          const existing = await adapter.stat(rel(path));
+          if (existing) throw cause;
+        } catch {
+          throw cause;
+        }
         const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, open '${path}'`);
         err.code = "ENOENT";
         throw err;

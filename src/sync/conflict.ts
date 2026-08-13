@@ -5,6 +5,7 @@ import { ConflictFile } from "../types";
  * Used in the conflict modal to help the user decide.
  */
 export function diffSummary(conflict: ConflictFile): string {
+  if (conflict.isBinary) return "Binary file — choose a side to preserve its exact bytes.";
   const oursLines   = conflict.ours.split("\n");
   const theirsLines = conflict.theirs.split("\n");
 
