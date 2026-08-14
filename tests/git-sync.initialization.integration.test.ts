@@ -67,6 +67,56 @@ test("initAndPush retries safely after a failed setup left a partial git directo
   });
 });
 
+test("normal sync establishes unborn main and pushes it to an empty remote", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "unborn-normal-sync");
+    await device.write("note.md", "created by normal sync\n");
+    await git(["init", "--initial-branch=main"], device.dir);
+    await git(["remote", "add", "origin", remote.url], device.dir);
+    await assert.rejects(git(["rev-parse", "refs/heads/main"], device.dir));
+
+    const first = await device.sync.sync(["note.md"]);
+    assert.equal(first.success, true, first.error);
+    assert.ok(first.logs?.some((line) => line.includes("step1 establishing initial main")));
+    assert.ok(first.logs?.some((line) => line.includes("step1 main=")));
+    assert.ok(first.logs?.some((line) => line.includes("step3 pushing attempt=")));
+    assert.ok(first.logs?.some((line) => line.includes("step3 push success")));
+
+    const localMain = await git(["rev-parse", "refs/heads/main"], device.dir);
+    const remoteMain = await git(["--git-dir", remote.remotePath, "rev-parse", "refs/heads/main"]);
+    assert.equal(localMain, remoteMain);
+    assert.equal(await git(["symbolic-ref", "HEAD"], device.dir), "refs/heads/main");
+    assert.equal(
+      await git(["--git-dir", remote.remotePath, "show", "main:note.md"]),
+      "created by normal sync"
+    );
+
+    const second = await device.sync.sync([]);
+    assert.equal(second.success, true, second.error);
+    assert.ok(second.logs?.some((line) => line.includes("nothing to push")));
+  });
+});
+
+test("normal sync fails explicitly if initial main cannot be established", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "unborn-main-failure");
+    await device.write("note.md", "must not report success\n");
+    await git(["init", "--initial-branch=main"], device.dir);
+    await git(["remote", "add", "origin", remote.url], device.dir);
+    const internals = device.sync as unknown as {
+      establishInitialMain: (message: string) => Promise<string>;
+    };
+    internals.establishInitialMain = async () => "0".repeat(40);
+
+    const result = await device.sync.sync(["note.md"]);
+    assert.equal(result.success, false);
+    assert.match(result.error ?? "", /could not establish local branch 'main'/i);
+    assert.equal(result.logs?.some((line) => line.includes("step3 pushing attempt=")), false);
+    await assert.rejects(git(["rev-parse", "refs/heads/main"], device.dir));
+    await assert.rejects(git(["--git-dir", remote.remotePath, "rev-parse", "refs/heads/main"]));
+  });
+});
+
 test("sync treats a reachable empty remote as empty and performs the first non-forced push", async () => {
   await withEmptyRemote(async ({ remote, root }) => {
     const device = await makeDevice(remote.url, root, "reconnect-empty-remote");

@@ -220,6 +220,44 @@ export class GitSync {
   }
 
   /**
+   * Create the first commit without relying on isomorphic-git to update an
+   * unborn short branch, then explicitly establish main and symbolic HEAD.
+   */
+  private async establishInitialMain(message: string): Promise<string> {
+    const initialOid = await git.commit({
+      ...this.gitOpts(),
+      ref: DEFAULT_BRANCH,
+      noUpdateBranch: true,
+      message,
+    });
+    await git.writeRef({
+      fs: this.fs,
+      dir: this.dir,
+      ref: `refs/heads/${DEFAULT_BRANCH}`,
+      value: initialOid,
+      force: false,
+    });
+    await git.writeRef({
+      fs: this.fs,
+      dir: this.dir,
+      ref: "HEAD",
+      value: `refs/heads/${DEFAULT_BRANCH}`,
+      force: true,
+      symbolic: true,
+    });
+
+    const resolved = await git.resolveRef({
+      fs: this.fs,
+      dir: this.dir,
+      ref: `refs/heads/${DEFAULT_BRANCH}`,
+    });
+    if (resolved !== initialOid) {
+      throw new Error(`Could not establish local '${DEFAULT_BRANCH}' at the initial commit`);
+    }
+    return initialOid;
+  }
+
+  /**
    * Fetch from origin. Returns the FETCH_HEAD oid when remote has commits,
    * or null when a reachable remote has no main branch. Genuine transport,
    * authentication, permission, and repository errors set lastFetchError.
@@ -464,30 +502,7 @@ export class GitSync {
 
     const localBranchExists = await this.hasLocalBranch();
     if (!localBranchExists) {
-      // On an unborn repository isomorphic-git's short `ref: "main"` can create
-      // an object without establishing refs/heads/main. Create the commit object
-      // first, then explicitly establish both the branch and symbolic HEAD.
-      const initialOid = await git.commit({
-        ...this.gitOpts(),
-        ref: DEFAULT_BRANCH,
-        noUpdateBranch: true,
-        message: "sync: initial vault snapshot",
-      });
-      await git.writeRef({
-        fs: this.fs,
-        dir: this.dir,
-        ref: `refs/heads/${DEFAULT_BRANCH}`,
-        value: initialOid,
-        force: false,
-      });
-      await git.writeRef({
-        fs: this.fs,
-        dir: this.dir,
-        ref: "HEAD",
-        value: `refs/heads/${DEFAULT_BRANCH}`,
-        force: true,
-        symbolic: true,
-      });
+      await this.establishInitialMain("sync: initial vault snapshot");
     } else {
       // Subsequent call (retry) — only commit if something changed
       const status = await git.statusMatrix({ fs: this.fs, dir: this.dir });
@@ -585,8 +600,18 @@ export class GitSync {
 
       if (mustCommit) {
         const now = new Date().toISOString().replace("T", " ").slice(0, 19);
-        const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
-        log(`step1 committed=${short(oid)}`);
+        if (!hasLocal) {
+          log(`step1 establishing initial ${DEFAULT_BRANCH}`);
+          const oid = await this.establishInitialMain(`sync: ${now}`);
+          log(`step1 ${DEFAULT_BRANCH}=${short(oid)}`);
+        } else {
+          const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
+          log(`step1 committed=${short(oid)}`);
+        }
+      }
+
+      if (!(await this.hasLocalBranch())) {
+        throw new Error(`Sync initialization failed: could not establish local branch '${DEFAULT_BRANCH}'.`);
       }
 
       // ── 2. Fetch + merge remote ─────────────────────────────────────────────
@@ -608,7 +633,7 @@ export class GitSync {
       let conflicts = await this.mergeRemote(fetchHead, log);
 
       // ── 3. Push ─────────────────────────────────────────────────────────────
-      if (conflicts.length === 0 && (await this.hasLocalBranch())) {
+      if (conflicts.length === 0) {
         conflicts = await this.pushWithRetry(log, short);
       }
 
