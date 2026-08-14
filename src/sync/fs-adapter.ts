@@ -1,4 +1,5 @@
 import { DataAdapter } from "obsidian";
+import { normalizeGitPath, normalizeVaultPath } from "./paths";
 
 type Stats = {
   type: "file" | "dir";
@@ -22,11 +23,11 @@ type Stats = {
  * We strip the vaultPath prefix before calling Obsidian's adapter (which uses relative paths).
  */
 export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
+  const base = normalizeVaultPath(vaultPath);
   /** Strip the vault root prefix so Obsidian adapter gets relative paths */
   function rel(absPath: string): string {
-    const normalized = absPath.replace(/\\/g, "/");
-    const base = vaultPath.replace(/\\/g, "/").replace(/\/$/, "");
-    if (base === "") return normalized.replace(/^\//, "");
+    const normalized = normalizeVaultPath(absPath);
+    if (base === "") return normalizeGitPath(normalized);
     // The vault root itself (absPath === base) must map to "", not to `base`.
     // Otherwise adapter.list(base) looks for a subfolder literally named after
     // the vault dir, fails, and isomorphic-git sees an EMPTY working tree — every
@@ -34,10 +35,16 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     // commits that never merge/pull. This is the mobile-only root-dir case.
     if (normalized === base) return "";
     if (normalized.startsWith(base + "/")) {
-      return normalized.slice(base.length + 1);
+      return normalizeGitPath(normalized.slice(base.length + 1));
     }
-    return normalized;
+    return normalizeGitPath(normalized);
   }
+
+  const isNotFound = (error: unknown): boolean => {
+    const code = (error as { code?: string })?.code;
+    const message = error instanceof Error ? error.message : String(error);
+    return code === "ENOENT" || code === "NotFoundError" || /no such file|not found/i.test(message);
+  };
 
   const promises = {
     async readFile(
@@ -58,7 +65,15 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
           return Buffer.from(content).toString("utf8");
         }
         return Buffer.from(content);
-      } catch {
+      } catch (cause) {
+        // Only claim ENOENT when the adapter can positively prove absence.
+        // Permission/provider/transient failures must remain distinguishable.
+        try {
+          const existing = await adapter.stat(rel(path));
+          if (existing) throw cause;
+        } catch {
+          throw cause;
+        }
         const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, open '${path}'`);
         err.code = "ENOENT";
         throw err;
@@ -71,7 +86,7 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
       const parts = relativePath.split("/");
       if (parts.length > 1) {
         const dir = parts.slice(0, -1).join("/");
-        try { await adapter.mkdir(dir); } catch { /* already exists */ }
+        await promises.mkdir(base ? `${base}/${dir}` : dir);
       }
       if (typeof data === "string") {
         await adapter.write(relativePath, data);
@@ -84,8 +99,13 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     async unlink(path: string): Promise<void> {
       try {
         await adapter.remove(rel(path));
-      } catch {
-        /* ignore if not found */
+      } catch (error) {
+        if (isNotFound(error)) return;
+        // Some DataAdapters do not provide errno-style remove errors. A null
+        // stat is the only other positive proof that the target is absent.
+        const existing = await adapter.stat(rel(path));
+        if (existing === null) return;
+        throw error;
       }
     },
 
@@ -95,7 +115,8 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
         const files = result.files.map((f) => f.split("/").pop()!);
         const folders = result.folders.map((f) => f.split("/").pop()!);
         return [...folders, ...files];
-      } catch {
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
         const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, scandir '${path}'`);
         err.code = "ENOENT";
         throw err;
@@ -105,8 +126,10 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     async mkdir(path: string, _options?: unknown): Promise<void> {
       try {
         await adapter.mkdir(rel(path));
-      } catch {
-        /* already exists — ignore */
+      } catch (error) {
+        const existing = await adapter.stat(rel(path));
+        if (existing?.type === "folder") return;
+        throw error;
       }
     },
 
@@ -115,33 +138,52 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     },
 
     async stat(path: string): Promise<Stats> {
+      let s;
       try {
-        const s = await adapter.stat(rel(path));
-        if (!s) throw new Error("no stat");
-        const isDir = s.type !== "file";
-        return {
+        s = await adapter.stat(rel(path));
+      } catch (cause) {
+        throw cause;
+      }
+      if (!s) {
+        const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, stat '${path}'`);
+        err.code = "ENOENT";
+        throw err;
+      }
+      const isDir = s.type !== "file";
+      return {
           type: isDir ? "dir" : "file",
           mode: isDir ? 0o040755 : 0o100644,
           size: s.size ?? 0,
           ino: 0,
-          mtimeMs: s.mtime ?? Date.now(),
-          ctimeMs: s.ctime ?? Date.now(),
+          mtimeMs: s.mtime ?? 0,
+          ctimeMs: s.ctime ?? 0,
           uid: 1,
           gid: 1,
           dev: 1,
           isFile: () => !isDir,
           isDirectory: () => isDir,
           isSymbolicLink: () => false,
-        };
-      } catch {
-        const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, stat '${path}'`);
-        err.code = "ENOENT";
-        throw err;
-      }
+      };
     },
 
     async lstat(path: string): Promise<Stats> {
-      return promises.stat(path);
+      const lstat = (adapter as DataAdapter & { lstat?: (path: string) => Promise<{
+        type: "file" | "folder"; size: number; mtime: number; ctime: number; isSymbolicLink?: boolean;
+      } | null> }).lstat;
+      if (!lstat) return promises.stat(path);
+      const s = await lstat.call(adapter, rel(path));
+      if (!s) {
+        const error = Object.assign(new Error(`ENOENT: no such file '${path}'`), { code: "ENOENT" });
+        throw error;
+      }
+      const isDir = s.type === "folder";
+      return {
+        type: isDir ? "dir" : "file", mode: isDir ? 0o040755 : 0o100644,
+        size: s.size, ino: 0, mtimeMs: s.mtime, ctimeMs: s.ctime,
+        uid: 1, gid: 1, dev: 1,
+        isFile: () => !isDir, isDirectory: () => isDir,
+        isSymbolicLink: () => s.isSymbolicLink === true,
+      };
     },
 
     async readlink(path: string): Promise<string> {
@@ -157,5 +199,8 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     },
   };
 
-  return { promises };
+  return {
+    promises,
+    supportsSymlinkChecks: typeof (adapter as DataAdapter & { lstat?: unknown }).lstat === "function",
+  };
 }

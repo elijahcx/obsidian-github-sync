@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An Obsidian community plugin ("Git Sync") that syncs a vault across devices by committing it to the user's own private GitHub repo. Runs on desktop **and** mobile (iOS/Android), so all git and HTTP work goes through pure-JS/Obsidian APIs — no native binaries, no Node `fs`, no `fetch`.
+An Obsidian community plugin ("Git Sync Vault") that syncs a vault across devices by committing it to the user's own private GitHub repo. Runs on desktop **and** mobile (iOS/Android), so all git and HTTP work goes through pure-JS/Obsidian APIs — no native binaries, no Node `fs`, no `fetch`.
 
 ## Commands
 
@@ -16,7 +16,7 @@ npm run build    # production build — minified, no sourcemaps
 
 There is **no test suite or linter**, and no typecheck npm script — but `npx tsc --noEmit` runs clean and is the fastest check after editing (esbuild does not typecheck). `tsconfig.json` is otherwise used by esbuild for transpile only (`isolatedModules`, `strictNullChecks`). Beyond that, verify by loading the built `main.js` in an Obsidian vault.
 
-The build entry is `src/main.ts` → bundled to `main.js` (git-ignored). To test in Obsidian, copy/symlink `main.js` + `manifest.json` into `<vault>/.obsidian/plugins/git-obsi-sync/`.
+The build entry is `src/main.ts` → bundled to `main.js` (git-ignored). To test in Obsidian, copy/symlink `main.js` + `manifest.json` into `<vault>/.obsidian/plugins/gitsyncvault/`.
 
 Releases are tag-triggered: pushing a git tag runs `.github/workflows/release.yml`, which builds and attaches `main.js` + `manifest.json` to a GitHub Release.
 
@@ -61,6 +61,6 @@ Mobile has no reachable dev console, so `GitSync.sync()` accumulates a step trac
 ## Gotchas
 
 - **The OAuth Client ID is a runtime setting, not a build-time secret.** Each user registers their own GitHub OAuth App (Device Flow enabled) and pastes the Client ID into plugin settings (`settings.clientId`, threaded through `settings-tab.ts` → `requestDeviceCode`). `src/constants.ts` deliberately has no `CLIENT_ID`; the build needs no `.env` or CI secret. Don't reintroduce a build-time inject — see README § "Register a GitHub OAuth App".
-- **Naming is inconsistent.** `package.json`/`PLUGIN_ID`/esbuild banner say `obsidian-multisync`; `manifest.json` id is `git-obsi-sync` (this is the folder name Obsidian uses under `.obsidian/plugins/`, and it must match the manifest id or the plugin fails to load). User-facing name is "Git Sync". Don't "fix" one without checking the others.
+- **Plugin identity must stay consistent.** The manifest and runtime plugin ID are `gitsyncvault`, the user-facing name is "Git Sync Vault", and the installation folder must be `.obsidian/plugins/gitsyncvault/`.
 - `excludePatterns` matching supports only `*` as a wildcard (converted to `.*`), anchored full-match — not full glob. The default is exactly one entry, `.obsidian/*`: the whole config dir is unsynced because plugin code, themes, and device-local state differ per device. Only notes & attachments sync.
 - `vaultNameToRepoName()` just slugifies (no `obsidian-` prefix) and is only a **fallback** — `main.ts:122` prefers the user-supplied `settings.repoName`.

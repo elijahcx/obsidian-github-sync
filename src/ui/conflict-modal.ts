@@ -1,8 +1,9 @@
 import { App, Modal, Setting, Component } from "obsidian";
-import { ConflictFile } from "../types";
+import { ConflictChoice, ConflictFile } from "../types";
 import { diffSummary } from "../sync/conflict";
 
-type ResolveCallback = (filepath: string, resolvedContent: string) => Promise<void>;
+export type ResolveOutcome = "accepted" | "replaced" | "rejected";
+type ResolveCallback = (filepath: string, choice: ConflictChoice, conflictSessionId: string) => Promise<ResolveOutcome>;
 
 export class ConflictModal extends Modal {
   private conflicts: ConflictFile[];
@@ -12,6 +13,7 @@ export class ConflictModal extends Modal {
   private component: Component;
   /** True once every conflict has been decided — suppresses the abandon callback. */
   private completed = false;
+  private resolving = false;
 
   constructor(
     app: App,
@@ -90,7 +92,7 @@ export class ConflictModal extends Modal {
     new Setting(contentEl)
       .addButton((btn) =>
         btn.setButtonText("Keep Mine").onClick(async () => {
-          await this.resolve(conflict, conflict.ours);
+          await this.resolve(conflict, this.choice(conflict, "ours"));
         })
       )
       .addButton((btn) =>
@@ -98,7 +100,7 @@ export class ConflictModal extends Modal {
           .setButtonText("Keep Theirs")
           .setCta()
           .onClick(async () => {
-            await this.resolve(conflict, conflict.theirs);
+            await this.resolve(conflict, this.choice(conflict, "theirs"));
           })
       )
       .addButton((btn) =>
@@ -109,16 +111,45 @@ export class ConflictModal extends Modal {
       );
   }
 
-  private async resolve(conflict: ConflictFile, content: string): Promise<void> {
-    this.currentIndex++;
-    // Mark complete BEFORE the last onResolve so close() doesn't abandon the merge
-    // that this very call is about to apply.
-    if (this.currentIndex >= this.conflicts.length) this.completed = true;
-    await this.onResolve(conflict.path, content);
-    if (this.currentIndex < this.conflicts.length) {
+  private choice(conflict: ConflictFile, side: "ours" | "theirs"): ConflictChoice {
+    const exists = side === "ours" ? conflict.oursExists : conflict.theirsExists;
+    const bytes = side === "ours" ? conflict.oursBytes : conflict.theirsBytes;
+    const text = side === "ours" ? conflict.ours : conflict.theirs;
+    return { exists, content: conflict.isBinary ? Uint8Array.from(bytes ?? []) : text };
+  }
+
+  private async resolve(conflict: ConflictFile, choice: ConflictChoice): Promise<void> {
+    if (this.resolving) return;
+    this.resolving = true;
+    for (const button of Array.from(this.contentEl.querySelectorAll("button"))) {
+      (button as HTMLButtonElement).disabled = true;
+    }
+    try {
+      const outcome = await this.onResolve(conflict.path, choice, conflict.conflictSessionId);
+      if (outcome === "rejected") {
+        this.renderCurrent();
+        return;
+      }
+      if (outcome === "replaced") {
+        this.completed = true;
+        this.close();
+        return;
+      }
+      this.currentIndex++;
+      if (this.currentIndex >= this.conflicts.length) {
+        this.completed = true;
+        this.close();
+      } else {
+        this.renderCurrent();
+      }
+    } catch (error) {
       this.renderCurrent();
-    } else {
-      this.close();
+      this.contentEl.createEl("p", {
+        text: `Resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+        cls: "mod-warning",
+      });
+    } finally {
+      this.resolving = false;
     }
   }
 }

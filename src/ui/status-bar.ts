@@ -2,7 +2,7 @@ import { Plugin } from "obsidian";
 import { SyncStatus } from "../types";
 
 const STATUS_ICONS: Record<SyncStatus, string> = {
-  idle:       "✓ MultiSync",
+  idle:       "✓ Git Sync Vault",
   pulling:    "↓ Syncing…",
   pushing:    "↑ Syncing…",
   conflict:   "⚠ Conflict",

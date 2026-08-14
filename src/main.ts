@@ -1,10 +1,13 @@
-import { Plugin, Notice, TFile, TAbstractFile, Modal } from "obsidian";
+import { Plugin, Notice, TFile, TFolder, TAbstractFile, Modal } from "obsidian";
 import { PluginSettings, DEFAULT_SETTINGS, SyncStatus, ConflictFile } from "./types";
 import { MultiSyncSettingsTab } from "./ui/settings-tab";
 import { StatusBarItem } from "./ui/status-bar";
 import { ConflictModal } from "./ui/conflict-modal";
 import { GitSync } from "./sync/git-sync";
 import { SyncQueue } from "./sync/queue";
+import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename } from "./sync/events";
+import { normalizeGitPath } from "./sync/paths";
+import { persistResolutionMetadata } from "./sync/resolution-completion";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
 
 export default class MultiSyncPlugin extends Plugin {
@@ -44,6 +47,7 @@ export default class MultiSyncPlugin extends Plugin {
         try {
           const conflicts = await this.gitSync.pull();
           if (conflicts.length > 0) {
+            this.syncQueue?.pauseForConflict();
             this.setStatus("conflict");
             this.showConflictModal(conflicts);
           } else {
@@ -77,24 +81,49 @@ export default class MultiSyncPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on("delete", (file: TAbstractFile) => {
-        if (!(file instanceof TFile)) return;
         if (!this.syncQueue || !this.settings.autoSync) return;
-        this.syncQueue.enqueue(file.path);
+        if (file instanceof TFile) {
+          enqueueDelete(this.syncQueue, file.path, (path) => this.isExcluded(path));
+        } else if (file instanceof TFolder) {
+          enqueueFolderDelete(this.syncQueue, file.path, (path) => this.isExcluded(path));
+        }
       })
     );
 
     this.registerEvent(
-      this.app.vault.on("rename", (_file: TAbstractFile, oldPath: string) => {
+      this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
         if (!this.syncQueue || !this.settings.autoSync) return;
-        this.syncQueue.enqueue(oldPath);
+        if (file instanceof TFile) {
+          enqueueRename(this.syncQueue, oldPath, file.path, (path) => this.isExcluded(path));
+        } else if (file instanceof TFolder) {
+          enqueueFolderRename(
+            this.syncQueue,
+            oldPath,
+            file.path,
+            this.filesInFolder(file),
+            (path) => this.isExcluded(path)
+          );
+        }
       })
     );
+  }
+
+  private filesInFolder(folder: TFolder): string[] {
+    const paths: string[] = [];
+    const visit = (current: TFolder): void => {
+      for (const child of current.children) {
+        if (child instanceof TFile) paths.push(child.path);
+        else if (child instanceof TFolder) visit(child);
+      }
+    };
+    visit(folder);
+    return paths;
   }
 
   async onunload(): Promise<void> {
     // Flush pending changes on close
     if (this.syncQueue) {
-      await this.syncQueue.flushNow();
+      await this.syncQueue.shutdown();
     }
   }
 
@@ -195,16 +224,22 @@ export default class MultiSyncPlugin extends Plugin {
         this.settings.lastSyncTime = Date.now();
         this.saveSettings();
       }
-    });
+    }, this.settings.syncIntervalMs);
+  }
+
+  updateSyncIntervalMs(debounceMs: number): void {
+    this.syncQueue?.setDebounceMs(debounceMs);
   }
 
   async triggerManualSync(): Promise<void> {
     if (!this.gitSync) {
       new Notice(
-        "MultiSync: not connected. Please connect your GitHub account in settings."
+        "Git Sync Vault: not connected. Please connect your GitHub account in settings."
       );
       return;
     }
+
+    this.syncQueue?.supersedeConflictForManualSync();
 
     this.setStatus("pulling");
     try {
@@ -213,7 +248,7 @@ export default class MultiSyncPlugin extends Plugin {
         .map((f) => f.path)
         .filter((p) => !this.isExcluded(p));
 
-      const result = await this.gitSync.sync(allFiles);
+      const result = await this.gitSync.syncAll(allFiles);
 
       // DEBUG: show the full step-by-step trace on-screen (mobile has no console).
       if (result.logs && result.logs.length) {
@@ -224,9 +259,11 @@ export default class MultiSyncPlugin extends Plugin {
       }
 
       if (result.conflictFiles.length > 0) {
+        this.syncQueue?.pauseForConflict();
         this.setStatus("conflict");
         this.showConflictModal(result.conflictFiles);
       } else if (result.success) {
+        this.syncQueue?.resumeAfterConflict();
         this.settings.lastSyncTime = Date.now();
         await this.saveSettings();
         this.setStatus("idle");
@@ -245,26 +282,51 @@ export default class MultiSyncPlugin extends Plugin {
     new ConflictModal(
       this.app,
       conflicts,
-      async (filepath, resolved) => {
+      async (filepath, resolved, conflictSessionId) => {
         // Returns true only once EVERY conflict is decided and the merge landed.
-        const merged = await this.gitSync!.resolveConflict(filepath, resolved);
-        if (merged) {
+        const result = await this.gitSync!.resolveConflict(filepath, resolved, conflictSessionId);
+        if (result.stale) {
+          this.setStatus("error", result.message);
+          new Notice(result.message ?? "Conflict is stale. Please sync again.");
+          this.syncQueue?.resumeAfterConflict();
+          return "rejected";
+        }
+        if (result.message && !result.completed) {
+          new Notice(result.message);
+          return "rejected";
+        }
+        if (result.conflictFiles?.length) {
+          this.setStatus("conflict");
+          this.showConflictModal(result.conflictFiles);
+          return "replaced";
+        }
+        if (result.completed) {
           this.settings.lastSyncTime = Date.now();
-          await this.saveSettings();
           this.setStatus("idle");
           new Notice("Conflicts resolved — vault synced.");
+          this.syncQueue?.resumeAfterConflict();
+          await persistResolutionMetadata(() => this.saveSettings(), (error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`[git-sync] Conflict resolved, but settings could not be saved: ${message}`);
+            new Notice(`Vault synced, but sync time could not be saved: ${message}`);
+          });
         }
+        return "accepted";
       },
       () => {
         // Dismissed without deciding everything: drop the pending merge so the
         // repo stays exactly as it was. The next sync will offer it again.
-        this.gitSync?.abandonMerge();
-        this.setStatus("idle");
+        void (async () => {
+          await this.gitSync?.abandonMerge(conflicts[0].conflictSessionId);
+          this.syncQueue?.resumeAfterConflict();
+          this.setStatus("idle");
+        })();
       }
     ).open();
   }
 
   private isExcluded(filepath: string): boolean {
+    filepath = normalizeGitPath(filepath);
     return this.settings.excludePatterns.some((pattern) => {
       // Convert simple glob pattern (supports *) to regex
       const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
