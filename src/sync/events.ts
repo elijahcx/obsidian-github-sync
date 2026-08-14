@@ -26,3 +26,32 @@ export function enqueueDelete(
   const gitPath = normalizeGitPath(filepath);
   if (!isExcluded(gitPath)) queue.enqueue(gitPath);
 }
+
+/** Queue a folder rename plus every currently materialized child file. */
+export function enqueueFolderRename(
+  queue: FileChangeQueue,
+  oldPath: string,
+  newPath: string,
+  newChildPaths: string[],
+  isExcluded: (filepath: string) => boolean
+): void {
+  enqueueRename(queue, oldPath, newPath, isExcluded);
+  const normalizedNew = normalizeGitPath(newPath);
+  const normalizedOld = normalizeGitPath(oldPath);
+  for (const childInput of newChildPaths) {
+    const child = normalizeGitPath(childInput);
+    const suffix = child.startsWith(`${normalizedNew}/`)
+      ? child.slice(normalizedNew.length + 1)
+      : child;
+    enqueueRename(queue, `${normalizedOld}/${suffix}`, child, isExcluded);
+  }
+}
+
+/** A missing folder path is expanded to tracked descendants by GitSync. */
+export function enqueueFolderDelete(
+  queue: FileChangeQueue,
+  folderPath: string,
+  isExcluded: (filepath: string) => boolean
+): void {
+  enqueueDelete(queue, folderPath, isExcluded);
+}

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { SYNC_DEBOUNCE_MS } from "../src/constants";
-import { enqueueDelete, enqueueRename } from "../src/sync/events";
+import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename } from "../src/sync/events";
 import { SyncQueue } from "../src/sync/queue";
 import type { GitSync } from "../src/sync/git-sync";
 import { normalizeGitPath, normalizeVaultPath } from "../src/sync/paths";
@@ -77,6 +77,19 @@ test("excluded deletes do not queue sync work while normal deletes do", () => {
   assert.deepEqual(queue.paths, ["note.md"]);
 });
 
+test("folder rename and delete enqueue recursive, normalized, exclusion-safe work", () => {
+  const queue = recordingQueue();
+  enqueueFolderRename(queue, "old", "new", ["new/a.md", "new/nested/b.md"], excluded);
+  enqueueFolderDelete(queue, "deleted", excluded);
+  assert.deepEqual(queue.paths, [
+    "old", "new", "old/a.md", "new/a.md", "old/nested/b.md", "new/nested/b.md", "deleted",
+  ]);
+
+  const movedIntoExcluded = recordingQueue();
+  enqueueFolderRename(movedIntoExcluded, "notes", ".obsidian/notes", [".obsidian/notes/a.md"], excluded);
+  assert.deepEqual(movedIntoExcluded.paths, ["notes", "notes/a.md"]);
+});
+
 function queueWithSync(debounceMs?: number): { queue: SyncQueue; calls: string[][] } {
   const calls: string[][] = [];
   const sync = {
@@ -114,4 +127,87 @@ test("changing debounce while work is pending safely reschedules the flush", asy
   assert.deepEqual(calls, [["note.md"]]);
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(calls.length, 1);
+});
+
+test("failed SyncQueue batches remain pending and succeed on a later retry", async () => {
+  let attempts = 0;
+  const calls: string[][] = [];
+  const sync = { sync: async (files: string[]) => {
+    calls.push(files);
+    attempts++;
+    return attempts === 1
+      ? { success: false, conflictFiles: [], error: "offline" }
+      : { success: true, conflictFiles: [] };
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 1000);
+  queue.enqueue("a.md");
+  const failed = await queue.flushNow();
+  assert.equal(failed?.success, false);
+  assert.deepEqual(queue.getPendingFiles(), ["a.md"]);
+  const recovered = await queue.flushNow();
+  assert.equal(recovered?.success, true);
+  assert.deepEqual(calls, [["a.md"], ["a.md"]]);
+  assert.deepEqual(queue.getPendingFiles(), []);
+});
+
+test("events arriving during a failed batch remain queued without concurrent flushes", async () => {
+  let release!: (result: { success: boolean; conflictFiles: never[]; error?: string }) => void;
+  let active = 0;
+  let maxActive = 0;
+  const calls: string[][] = [];
+  const sync = { sync: async (files: string[]) => {
+    calls.push(files);
+    active++;
+    maxActive = Math.max(maxActive, active);
+    const result = await new Promise<{ success: boolean; conflictFiles: never[]; error?: string }>((resolve) => { release = resolve; });
+    active--;
+    return result;
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 1000);
+  queue.enqueue("a.md");
+  const first = queue.flushNow();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  queue.enqueue("b.md");
+  const overlapping = queue.flushNow();
+  release({ success: false, conflictFiles: [], error: "temporary" });
+  await Promise.all([first, overlapping]);
+  assert.equal(maxActive, 1);
+  assert.deepEqual(new Set(queue.getPendingFiles()), new Set(["a.md", "b.md"]));
+  assert.deepEqual(calls, [["a.md"]]);
+});
+
+test("shutdown drains pending debounce and waits for an active flush without overlap", async () => {
+  let release!: () => void;
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const sync = { sync: async () => {
+    calls++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    if (calls === 1) await new Promise<void>((resolve) => { release = resolve; });
+    active--;
+    return { success: true, conflictFiles: [] };
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 1000);
+  assert.equal(await queue.shutdown(), null); // idle
+  queue.enqueue("a.md");
+  const activeFlush = queue.flushNow();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  queue.enqueue("b.md");
+  const shutdown = queue.shutdown();
+  release();
+  await Promise.all([activeFlush, shutdown]);
+  assert.equal(calls, 2);
+  assert.equal(maxActive, 1);
+  assert.deepEqual(queue.getPendingFiles(), []);
+});
+
+test("a failed unload flush keeps its batch discoverable", async () => {
+  const sync = { sync: async () => ({ success: false, conflictFiles: [], error: "offline" }) } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 1000);
+  queue.enqueue("offline.md");
+  const result = await queue.shutdown();
+  assert.equal(result?.success, false);
+  assert.deepEqual(queue.getPendingFiles(), ["offline.md"]);
 });

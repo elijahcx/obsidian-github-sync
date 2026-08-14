@@ -2,7 +2,8 @@ import { App, Modal, Setting, Component } from "obsidian";
 import { ConflictChoice, ConflictFile } from "../types";
 import { diffSummary } from "../sync/conflict";
 
-type ResolveCallback = (filepath: string, choice: ConflictChoice, conflictSessionId: string) => Promise<void>;
+export type ResolveOutcome = "accepted" | "replaced" | "rejected";
+type ResolveCallback = (filepath: string, choice: ConflictChoice, conflictSessionId: string) => Promise<ResolveOutcome>;
 
 export class ConflictModal extends Modal {
   private conflicts: ConflictFile[];
@@ -12,6 +13,7 @@ export class ConflictModal extends Modal {
   private component: Component;
   /** True once every conflict has been decided — suppresses the abandon callback. */
   private completed = false;
+  private resolving = false;
 
   constructor(
     app: App,
@@ -117,15 +119,37 @@ export class ConflictModal extends Modal {
   }
 
   private async resolve(conflict: ConflictFile, choice: ConflictChoice): Promise<void> {
-    this.currentIndex++;
-    // Mark complete BEFORE the last onResolve so close() doesn't abandon the merge
-    // that this very call is about to apply.
-    if (this.currentIndex >= this.conflicts.length) this.completed = true;
-    await this.onResolve(conflict.path, choice, conflict.conflictSessionId);
-    if (this.currentIndex < this.conflicts.length) {
+    if (this.resolving) return;
+    this.resolving = true;
+    for (const button of Array.from(this.contentEl.querySelectorAll("button"))) {
+      (button as HTMLButtonElement).disabled = true;
+    }
+    try {
+      const outcome = await this.onResolve(conflict.path, choice, conflict.conflictSessionId);
+      if (outcome === "rejected") {
+        this.renderCurrent();
+        return;
+      }
+      if (outcome === "replaced") {
+        this.completed = true;
+        this.close();
+        return;
+      }
+      this.currentIndex++;
+      if (this.currentIndex >= this.conflicts.length) {
+        this.completed = true;
+        this.close();
+      } else {
+        this.renderCurrent();
+      }
+    } catch (error) {
       this.renderCurrent();
-    } else {
-      this.close();
+      this.contentEl.createEl("p", {
+        text: `Resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+        cls: "mod-warning",
+      });
+    } finally {
+      this.resolving = false;
     }
   }
 }

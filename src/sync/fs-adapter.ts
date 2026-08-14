@@ -124,11 +124,19 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     },
 
     async stat(path: string): Promise<Stats> {
+      let s;
       try {
-        const s = await adapter.stat(rel(path));
-        if (!s) throw new Error("no stat");
-        const isDir = s.type !== "file";
-        return {
+        s = await adapter.stat(rel(path));
+      } catch (cause) {
+        throw cause;
+      }
+      if (!s) {
+        const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, stat '${path}'`);
+        err.code = "ENOENT";
+        throw err;
+      }
+      const isDir = s.type !== "file";
+      return {
           type: isDir ? "dir" : "file",
           mode: isDir ? 0o040755 : 0o100644,
           size: s.size ?? 0,
@@ -141,12 +149,7 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
           isFile: () => !isDir,
           isDirectory: () => isDir,
           isSymbolicLink: () => false,
-        };
-      } catch {
-        const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, stat '${path}'`);
-        err.code = "ENOENT";
-        throw err;
-      }
+      };
     },
 
     async lstat(path: string): Promise<Stats> {

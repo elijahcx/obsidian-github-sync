@@ -143,6 +143,7 @@ test("corrupted and unsupported journals fail conservatively without changing fi
     await device.sync.clone();
     await device.write(".obsidian/workspace.json", "preserve\n");
     await mkdir(recoveryDir(device.dir), { recursive: true });
+    await writeFile(path.join(recoveryDir(device.dir), "orphan.bin"), "inspect me");
     await writeFile(path.join(recoveryDir(device.dir), "journal.json"), "{bad json");
     await assert.rejects(freshSync(device, remote.url).pull(), /journal is corrupted/);
     assert.equal(await device.read(".obsidian/workspace.json"), "preserve\n");
@@ -150,5 +151,54 @@ test("corrupted and unsupported journals fail conservatively without changing fi
     await writeFile(path.join(recoveryDir(device.dir), "journal.json"), JSON.stringify({ version: 999 }));
     await assert.rejects(freshSync(device, remote.url).pull(), /Unsupported sync recovery journal/);
     assert.equal(await readFile(path.join(device.dir, ".obsidian/workspace.json"), "utf8"), "preserve\n");
+    assert.equal(await readFile(path.join(recoveryDir(device.dir), "orphan.bin"), "utf8"), "inspect me");
+  });
+});
+
+test("startup removes only unreferenced recovery snapshot blobs", async () => {
+  await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "orphan-cleanup");
+    await device.sync.clone();
+    await mkdir(recoveryDir(device.dir), { recursive: true });
+    await writeFile(path.join(recoveryDir(device.dir), "orphan.bin"), "orphan");
+    await writeFile(path.join(recoveryDir(device.dir), "keep.txt"), "not a snapshot");
+    assert.equal((await freshSync(device, remote.url).sync([])).success, true);
+    await assert.rejects(stat(path.join(recoveryDir(device.dir), "orphan.bin")));
+    assert.equal(await readFile(path.join(recoveryDir(device.dir), "keep.txt"), "utf8"), "not a snapshot");
+  });
+});
+
+test("interrupted checkout is reconciled on restart only when working files still match the old head", async () => {
+  await withRemote({ "note.md": "old\n" }, async ({ remote, root }) => {
+    const source = await makeDevice(remote.url, root, "checkout-recovery-source");
+    const device = await makeDevice(remote.url, root, "checkout-recovery-device");
+    await source.sync.clone(); await device.sync.clone();
+    const beforeHead = await git(["rev-parse", "main"], device.dir);
+    await source.write("note.md", "remote\n");
+    assert.equal((await source.sync.sync(["note.md"])).success, true);
+    await git(["fetch", remote.url, "main"], device.dir);
+    const afterHead = await git(["rev-parse", "FETCH_HEAD"], device.dir);
+    await git(["update-ref", "refs/heads/main", afterHead], device.dir);
+    await device.write("note.md", "old\n");
+    await mkdir(recoveryDir(device.dir), { recursive: true });
+    await writeFile(path.join(recoveryDir(device.dir), "checkout.json"), JSON.stringify({
+      version: 1, beforeHead, afterHead, paths: ["note.md"],
+    }));
+
+    const recovered = await freshSync(device, remote.url).sync([]);
+    assert.equal(recovered.success, true, recovered.error);
+    assert.equal(await device.read("note.md"), "remote\n");
+    await assert.rejects(stat(path.join(recoveryDir(device.dir), "checkout.json")));
+
+    await device.write("note.md", "dirty user edit\n");
+    await writeFile(path.join(recoveryDir(device.dir), "checkout.json"), JSON.stringify({
+      version: 1, beforeHead, afterHead, paths: ["note.md"],
+    }));
+    await assert.rejects(
+      freshSync(device, remote.url).sync([]),
+      /preserve dirty local file/
+    );
+    assert.equal(await device.read("note.md"), "dirty user edit\n");
+    assert.equal(await git(["--git-dir", remote.remotePath, "rev-parse", "main"]), afterHead);
   });
 });

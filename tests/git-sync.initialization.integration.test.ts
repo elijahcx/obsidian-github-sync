@@ -234,3 +234,16 @@ test("populated remote fetch behavior remains unchanged", async () => {
     assert.equal(await device.read("remote.md"), "populated\n");
   });
 });
+
+test("push rejection classification requires explicit fast-forward evidence", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "push-classification");
+    const classify = (device.sync as unknown as {
+      isNonFastForwardPushError: (error: unknown) => boolean;
+    }).isNonFastForwardPushError.bind(device.sync);
+    assert.equal(classify(Object.assign(new Error("not a simple fast-forward"), { code: "PushRejectedError" })), true);
+    assert.equal(classify(Object.assign(new Error("authentication required"), { code: "PushRejectedError" })), false);
+    assert.equal(classify(Object.assign(new Error("permission denied"), { code: "PushRejectedError" })), false);
+    assert.equal(classify(Object.assign(new Error("protected branch policy"), { code: "PushRejectedError" })), false);
+  });
+});

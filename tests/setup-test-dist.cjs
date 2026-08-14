@@ -5,6 +5,7 @@ fs.mkdirSync(dir, { recursive: true });
 fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ type: 'commonjs', main: 'index.js' }));
 fs.writeFileSync(path.join(dir, 'index.js'), `
 class DataAdapter {}
+class Modal {}
 async function requestUrl(options) {
   const headers = options.headers || {};
   const init = { method: options.method || 'GET', headers, body: options.body };
@@ -15,5 +16,5 @@ async function requestUrl(options) {
   try { json = text ? JSON.parse(text) : undefined; } catch {}
   return { status: res.status, headers: Object.fromEntries(res.headers.entries()), arrayBuffer, text, json };
 }
-module.exports = { DataAdapter, requestUrl };
+module.exports = { DataAdapter, Modal, requestUrl };
 `);

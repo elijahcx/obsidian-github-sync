@@ -371,6 +371,22 @@ area is Git metadata and is never committed or pushed. If its journal is damaged
 or from an unsupported future version, synchronization stops without changing
 vault files and reports that manual recovery is required.
 
+### Manual Sync guarantees
+
+**Sync vault now** performs a full reconciliation rather than replaying only
+captured Obsidian events. It compares current non-excluded vault files with the
+files tracked by local `main`, stages new and modified files, positively confirms
+missed deletions, then fetches, merges, and performs a verified non-forced push.
+Excluded paths such as `.obsidian/*` are not treated as local deletions even when
+they remain in historical Git trees. Filesystem/provider errors abort the full
+sync instead of being interpreted as absence.
+
+Desktop mutexes use the normalized vault root, so independently created adapter
+wrappers for the same physical vault serialize in one process. Mobile adapters
+expose an empty vault root and therefore use adapter identity. Normal plugin
+runtime reuses the vault adapter; third-party code creating multiple wrappers
+around the same mobile storage must not run concurrent GitSync instances.
+
 ---
 
 ## Troubleshooting

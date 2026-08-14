@@ -1,11 +1,11 @@
-import { Plugin, Notice, TFile, TAbstractFile, Modal } from "obsidian";
+import { Plugin, Notice, TFile, TFolder, TAbstractFile, Modal } from "obsidian";
 import { PluginSettings, DEFAULT_SETTINGS, SyncStatus, ConflictFile } from "./types";
 import { MultiSyncSettingsTab } from "./ui/settings-tab";
 import { StatusBarItem } from "./ui/status-bar";
 import { ConflictModal } from "./ui/conflict-modal";
 import { GitSync } from "./sync/git-sync";
 import { SyncQueue } from "./sync/queue";
-import { enqueueDelete, enqueueRename } from "./sync/events";
+import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename } from "./sync/events";
 import { normalizeGitPath } from "./sync/paths";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
 
@@ -79,25 +79,49 @@ export default class MultiSyncPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on("delete", (file: TAbstractFile) => {
-        if (!(file instanceof TFile)) return;
         if (!this.syncQueue || !this.settings.autoSync) return;
-        enqueueDelete(this.syncQueue, file.path, (path) => this.isExcluded(path));
+        if (file instanceof TFile) {
+          enqueueDelete(this.syncQueue, file.path, (path) => this.isExcluded(path));
+        } else if (file instanceof TFolder) {
+          enqueueFolderDelete(this.syncQueue, file.path, (path) => this.isExcluded(path));
+        }
       })
     );
 
     this.registerEvent(
       this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
-        if (!(file instanceof TFile)) return;
         if (!this.syncQueue || !this.settings.autoSync) return;
-        enqueueRename(this.syncQueue, oldPath, file.path, (path) => this.isExcluded(path));
+        if (file instanceof TFile) {
+          enqueueRename(this.syncQueue, oldPath, file.path, (path) => this.isExcluded(path));
+        } else if (file instanceof TFolder) {
+          enqueueFolderRename(
+            this.syncQueue,
+            oldPath,
+            file.path,
+            this.filesInFolder(file),
+            (path) => this.isExcluded(path)
+          );
+        }
       })
     );
+  }
+
+  private filesInFolder(folder: TFolder): string[] {
+    const paths: string[] = [];
+    const visit = (current: TFolder): void => {
+      for (const child of current.children) {
+        if (child instanceof TFile) paths.push(child.path);
+        else if (child instanceof TFolder) visit(child);
+      }
+    };
+    visit(folder);
+    return paths;
   }
 
   async onunload(): Promise<void> {
     // Flush pending changes on close
     if (this.syncQueue) {
-      await this.syncQueue.flushNow();
+      await this.syncQueue.shutdown();
     }
   }
 
@@ -220,7 +244,7 @@ export default class MultiSyncPlugin extends Plugin {
         .map((f) => f.path)
         .filter((p) => !this.isExcluded(p));
 
-      const result = await this.gitSync.sync(allFiles);
+      const result = await this.gitSync.syncAll(allFiles);
 
       // DEBUG: show the full step-by-step trace on-screen (mobile has no console).
       if (result.logs && result.logs.length) {
@@ -258,12 +282,12 @@ export default class MultiSyncPlugin extends Plugin {
         if (result.stale) {
           this.setStatus("error", result.message);
           new Notice(result.message ?? "Conflict is stale. Please sync again.");
-          return;
+          return "rejected";
         }
         if (result.conflictFiles?.length) {
           this.setStatus("conflict");
           this.showConflictModal(result.conflictFiles);
-          return;
+          return "replaced";
         }
         if (result.completed) {
           this.settings.lastSyncTime = Date.now();
@@ -271,6 +295,7 @@ export default class MultiSyncPlugin extends Plugin {
           this.setStatus("idle");
           new Notice("Conflicts resolved — vault synced.");
         }
+        return "accepted";
       },
       () => {
         // Dismissed without deciding everything: drop the pending merge so the

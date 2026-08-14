@@ -24,6 +24,12 @@ type RecoveryJournal = {
   timestamp: string;
   snapshots: Array<{ path: string; existed: boolean; file?: string }>;
 };
+type CheckoutRecoveryJournal = {
+  version: 1;
+  beforeHead: string;
+  afterHead: string;
+  paths: string[];
+};
 
 /** A FIFO mutex shared by every GitSync instance using the same vault adapter. */
 class SyncMutex {
@@ -44,18 +50,29 @@ class SyncMutex {
 }
 
 const vaultMutexes = new WeakMap<DataAdapter, Map<string, SyncMutex>>();
+const canonicalVaultMutexes = new Map<string, SyncMutex>();
 
 function mutexFor(adapter: DataAdapter, vaultPath: string): SyncMutex {
+  const canonicalPath = normalizeVaultPath(vaultPath);
+  if (canonicalPath !== "") {
+    let mutex = canonicalVaultMutexes.get(canonicalPath);
+    if (!mutex) {
+      mutex = new SyncMutex();
+      canonicalVaultMutexes.set(canonicalPath, mutex);
+    }
+    return mutex;
+  }
+
   let adapterMutexes = vaultMutexes.get(adapter);
   if (!adapterMutexes) {
     adapterMutexes = new Map();
     vaultMutexes.set(adapter, adapterMutexes);
   }
 
-  let mutex = adapterMutexes.get(vaultPath);
+  let mutex = adapterMutexes.get(canonicalPath);
   if (!mutex) {
     mutex = new SyncMutex();
-    adapterMutexes.set(vaultPath, mutex);
+    adapterMutexes.set(canonicalPath, mutex);
   }
   return mutex;
 }
@@ -311,7 +328,11 @@ export class GitSync {
     try {
       raw = String(await this.fs.promises.readFile(journalPath, "utf8"));
     } catch (error) {
-      if ((error as { code?: string }).code === "ENOENT") return;
+      if ((error as { code?: string }).code === "ENOENT") {
+        await this.recoverCheckoutMaterialization();
+        await this.cleanupOrphanSnapshots();
+        return;
+      }
       throw error;
     }
 
@@ -362,6 +383,75 @@ export class GitSync {
     }
     await this.clearRecoveryJournal(journal);
     this.pendingMerge = null;
+    await this.recoverCheckoutMaterialization();
+    await this.cleanupOrphanSnapshots();
+  }
+
+  private async cleanupOrphanSnapshots(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await this.fs.promises.readdir(this.repoPath(RECOVERY_DIR));
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (entry !== "journal.json" && entry !== "checkout.json" && isSafeSnapshotBasename(entry)) {
+        await this.fs.promises.unlink(this.repoPath(`${RECOVERY_DIR}/${entry}`));
+      }
+    }
+  }
+
+  private async recoverCheckoutMaterialization(): Promise<void> {
+    const markerPath = this.repoPath(`${RECOVERY_DIR}/checkout.json`);
+    let raw: string;
+    try {
+      raw = String(await this.fs.promises.readFile(markerPath, "utf8"));
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return;
+      throw error;
+    }
+    let marker: CheckoutRecoveryJournal;
+    try {
+      marker = JSON.parse(raw) as CheckoutRecoveryJournal;
+    } catch {
+      throw new Error("Checkout recovery marker is corrupted; working files were not changed.");
+    }
+    if (
+      marker.version !== 1 ||
+      !/^[0-9a-f]{40}$/.test(marker.beforeHead) ||
+      !/^[0-9a-f]{40}$/.test(marker.afterHead) ||
+      !Array.isArray(marker.paths) ||
+      marker.paths.some((path) => !isSafeRelativePath(path) || this.isExcluded(path))
+    ) {
+      throw new Error("Checkout recovery marker is unsafe; working files were not changed.");
+    }
+    const currentHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+    if (currentHead !== marker.afterHead) {
+      throw new Error("Checkout recovery requires manual intervention because local HEAD changed.");
+    }
+
+    const safeToCheckout: string[] = [];
+    for (const path of marker.paths) {
+      const working = await this.readWorkingFileIfPresent(path);
+      const before = await this.readBlobBytesAtStrict(marker.beforeHead, path);
+      const after = await this.readBlobBytesAtStrict(marker.afterHead, path);
+      const equals = (value: Buffer | null, state: { exists: boolean; content: Uint8Array }) =>
+        state.exists ? value !== null && value.equals(Buffer.from(state.content)) : value === null;
+      if (equals(working, after)) continue;
+      if (equals(working, before)) safeToCheckout.push(path);
+      else throw new Error(`Checkout recovery stopped to preserve dirty local file: ${path}`);
+    }
+    if (safeToCheckout.length > 0) {
+      await git.checkout({
+        fs: this.fs,
+        dir: this.dir,
+        ref: DEFAULT_BRANCH,
+        force: true,
+        filepaths: safeToCheckout,
+      });
+    }
+    await this.fs.promises.unlink(markerPath);
   }
 
   private async clearRecoveryJournal(journal: RecoveryJournal): Promise<void> {
@@ -564,6 +654,68 @@ export class GitSync {
     });
   }
 
+  /** Full reconciliation used by Manual Sync; does not depend on vault events. */
+  async syncAll(currentFiles: string[]): Promise<SyncResult> {
+    return this.mutex.run(async () => {
+      await this.recoverInterruptedOperation();
+      const candidates = new Set(
+        currentFiles.map(normalizeGitPath).filter((path) => !this.isExcluded(path))
+      );
+      if (await this.hasLocalBranch()) {
+        for (const path of await git.listFiles({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH })) {
+          if (!this.isExcluded(path)) candidates.add(path);
+        }
+      }
+      return this.syncUnlocked([...candidates]);
+    });
+  }
+
+  private async trackedPaths(): Promise<string[]> {
+    if (!(await this.hasLocalBranch())) return [];
+    return git.listFiles({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+  }
+
+  /** Expand a missing directory event to its tracked descendants. */
+  private async expandChangedPaths(changedFiles: string[]): Promise<string[]> {
+    const tracked = await this.trackedPaths();
+    const expanded = new Set<string>();
+    for (const input of changedFiles) {
+      const path = normalizeGitPath(input);
+      if (this.isExcluded(path)) continue;
+      try {
+        const stats = await this.fs.promises.stat(this.repoPath(path));
+        if (stats.isDirectory()) {
+          // Current children arrive as ordinary file events (or explicit folder
+          // event expansion); a directory itself is not a Git path.
+          continue;
+        }
+        expanded.add(path);
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error;
+        const descendants = tracked.filter((trackedPath) => trackedPath.startsWith(`${path}/`));
+        if (descendants.length > 0) descendants.forEach((trackedPath) => expanded.add(trackedPath));
+        else expanded.add(path);
+      }
+    }
+    return [...expanded];
+  }
+
+  /** Stage only after proving whether the path exists; provider errors abort. */
+  private async stagePath(path: string): Promise<void> {
+    try {
+      const stats = await this.fs.promises.stat(this.repoPath(path));
+      if (stats.isDirectory()) return;
+      await git.add({ fs: this.fs, dir: this.dir, filepath: path });
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error;
+      try {
+        await git.remove({ fs: this.fs, dir: this.dir, filepath: path });
+      } catch (removeError) {
+        if ((removeError as { code?: string }).code !== "NotFoundError") throw removeError;
+      }
+    }
+  }
+
   private async syncUnlocked(changedFiles: string[]): Promise<SyncResult> {
     const logs: string[] = [];
     const log = (m: string) => { logs.push(m); console.log(`[git-sync] ${m}`); };
@@ -573,16 +725,9 @@ export class GitSync {
 
     try {
       // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
-      for (const inputFile of changedFiles) {
-        const file = normalizeGitPath(inputFile);
-        if (this.isExcluded(file)) continue;
-        try {
-          await git.add({ fs: this.fs, dir: this.dir, filepath: file });
-        } catch {
-          try {
-            await git.remove({ fs: this.fs, dir: this.dir, filepath: file });
-          } catch { /* skip */ }
-        }
+      const filesToStage = await this.expandChangedPaths(changedFiles);
+      for (const file of filesToStage) {
+        await this.stagePath(file);
       }
 
       // Commit ONLY if the staged tree differs from HEAD. Otherwise we'd create a
@@ -754,12 +899,8 @@ export class GitSync {
 
   /** True only for push rejections that should be solved by fetch/merge/retry. */
   private isNonFastForwardPushError(error: unknown): boolean {
-    const code = (error as { code?: string })?.code ?? "";
     const msg = error instanceof Error ? error.message : String(error);
-    return (
-      code === "PushRejectedError" ||
-      /not a simple fast-forward|non-fast-forward|fetch first/i.test(msg)
-    );
+    return /not a simple fast-forward|non-fast-forward|fetch first/i.test(msg);
   }
 
 
@@ -909,6 +1050,11 @@ export class GitSync {
       }
 
       if (changed.length === 0) return;
+      await this.fs.promises.mkdir(this.repoPath(RECOVERY_DIR), { recursive: true });
+      await this.fs.promises.writeFile(
+        this.repoPath(`${RECOVERY_DIR}/checkout.json`),
+        JSON.stringify({ version: 1, beforeHead, afterHead, paths: changed } satisfies CheckoutRecoveryJournal)
+      );
       await git.checkout({
         fs: this.fs,
         dir: this.dir,
@@ -916,6 +1062,7 @@ export class GitSync {
         force: true,
         filepaths: changed,
       });
+      await this.fs.promises.unlink(this.repoPath(`${RECOVERY_DIR}/checkout.json`));
       log(`step2 checked out ${changed.length} merged path(s)`);
     } catch (e) {
       const message = `step2 checkout failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -1231,6 +1378,21 @@ export class GitSync {
       return { exists: true, content: blob };
     } catch {
       return { exists: false, content: new Uint8Array() };
+    }
+  }
+
+  private async readBlobBytesAtStrict(
+    oid: string,
+    filepath: string
+  ): Promise<{ exists: boolean; content: Uint8Array }> {
+    try {
+      const { blob } = await git.readBlob({ fs: this.fs, dir: this.dir, oid, filepath });
+      return { exists: true, content: blob };
+    } catch (error) {
+      if ((error as { code?: string }).code === "NotFoundError") {
+        return { exists: false, content: new Uint8Array() };
+      }
+      throw error;
     }
   }
 

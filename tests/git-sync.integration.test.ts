@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { makeDevice, withRemote, git } from "./helpers/harness";
 
@@ -624,5 +624,53 @@ test("August 11 clone behavior preserves local excluded files while materializin
     assert.equal(await a.sync.clone(), true);
     assert.equal(await a.read("note.md"), "remote note\n");
     assert.equal(await a.read(".obsidian/workspace.json"), "local workspace\n");
+  });
+});
+
+test("full sync discovers missed tracked deletions, including nested notes", async () => {
+  await withRemote({ "note.md": "one\n", "nested/deep.md": "two\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "full-delete");
+    await device.sync.clone();
+    await device.adapter.remove("note.md");
+    await device.adapter.remove("nested/deep.md");
+    const result = await device.sync.syncAll([]);
+    assert.equal(result.success, true, result.error);
+    await assert.rejects(git(["--git-dir", remote.remotePath, "show", "main:note.md"]));
+    await assert.rejects(git(["--git-dir", remote.remotePath, "show", "main:nested/deep.md"]));
+  });
+});
+
+test("full sync never treats excluded absence or provider stat failure as deletion", async () => {
+  await withRemote({ "note.md": "keep\n", ".obsidian/workspace.json": "history\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "safe-full-delete");
+    await device.sync.clone();
+    const originalStat = device.adapter.stat.bind(device.adapter);
+    device.adapter.stat = async (filepath) => {
+      if (filepath === "note.md") throw Object.assign(new Error("provider unavailable"), { code: "EIO" });
+      return originalStat(filepath);
+    };
+    const result = await device.sync.syncAll([]);
+    assert.equal(result.success, false);
+    assert.match(result.error ?? "", /provider unavailable/);
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:note.md"]), "keep");
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:.obsidian/workspace.json"]), "history");
+  });
+});
+
+test("folder rename and deletion reconcile tracked descendants idempotently", async () => {
+  await withRemote({ "old/a.md": "a\n", "old/nested/b.md": "b\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "folder-events");
+    await device.sync.clone();
+    await rename(path.join(device.dir, "old"), path.join(device.dir, "new"));
+    const renamed = await device.sync.sync(["old", "new/a.md", "new/nested/b.md", "old/a.md"]);
+    assert.equal(renamed.success, true, renamed.error);
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:new/a.md"]), "a");
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:new/nested/b.md"]), "b");
+    await assert.rejects(git(["--git-dir", remote.remotePath, "show", "main:old/a.md"]));
+
+    await rm(path.join(device.dir, "new"), { recursive: true });
+    const deleted = await device.sync.sync(["new", "new/a.md"]);
+    assert.equal(deleted.success, true, deleted.error);
+    assert.equal(await git(["--git-dir", remote.remotePath, "ls-tree", "-r", "--name-only", "main"]), "");
   });
 });
