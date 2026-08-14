@@ -806,7 +806,7 @@ export class GitSync {
 
   private async syncUnlocked(changedFiles: string[]): Promise<SyncResult> {
     const logs: string[] = [];
-    const log = (m: string) => { logs.push(m); console.log(`[git-sync] ${m}`); };
+    const log = (m: string) => { logs.push(m); };
     const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
 
     log(`sync() start — ${changedFiles.length} candidate files`);
@@ -1281,7 +1281,7 @@ export class GitSync {
     // normal bounded fetch/merge/push discipline rather than doing a one-shot
     // push. mergeRemote() creates a fresh pending session if that retry reveals
     // another conflict; the session resolved above has already been cleared.
-    const log = (message: string) => console.log(`[git-sync] ${message}`);
+    const log = (_message: string): void => undefined;
     const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
     const conflicts = await this.pushWithRetry(log, short);
     if (conflicts.length > 0) {
@@ -1504,7 +1504,7 @@ export class GitSync {
       return [];
     }
 
-    return this.mergeRemote(fetchHead, (m) => console.log(`[git-sync] ${m}`));
+    return this.mergeRemote(fetchHead, () => undefined);
   }
 
   private async assertCleanForPull(): Promise<void> {

@@ -7,8 +7,7 @@ export class DiagnosticsModal extends Modal {
   onOpen(): void {
     this.titleEl.setText("Git Sync Vault: Sync diagnostics");
     const report = buildDiagnosticReport(this.diagnostics);
-    const pre = this.contentEl.createEl("pre");
-    pre.style.cssText = "white-space:pre-wrap;user-select:text;font-size:12px;";
+    const pre = this.contentEl.createEl("pre", { cls: "gitsyncvault-diagnostics-output" });
     pre.setText(report);
     const button = this.contentEl.createEl("button", { text: "Copy diagnostics" });
     button.onclick = async () => {

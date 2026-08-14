@@ -51,28 +51,22 @@ export class ConflictModal extends Modal {
     });
     contentEl.createEl("p", {
       text: `File: ${conflict.path}`,
-      cls: "conflict-filepath",
+      cls: "gitsyncvault-conflict-filepath",
     });
 
     // Diff summary
-    const diffEl = contentEl.createEl("pre", { cls: "conflict-diff" });
-    diffEl.style.cssText =
-      "background:var(--background-secondary);padding:8px;border-radius:4px;" +
-      "overflow:auto;max-height:180px;font-size:12px;";
+    const diffEl = contentEl.createEl("pre", { cls: "gitsyncvault-conflict-diff" });
     diffEl.textContent = diffSummary(conflict);
 
     // Two-column layout
-    const cols = contentEl.createDiv({ cls: "conflict-columns" });
-    cols.style.cssText =
-      "display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0;";
+    const cols = contentEl.createDiv({ cls: "gitsyncvault-conflict-columns" });
 
     // OURS
     const oursCol = cols.createDiv();
     oursCol.createEl("h4", { text: "Your version (this device)" });
-    const oursPre = oursCol.createEl("pre");
-    oursPre.style.cssText =
-      "background:#1a3a1a;padding:8px;border-radius:4px;" +
-      "overflow:auto;max-height:260px;font-size:11px;white-space:pre-wrap;";
+    const oursPre = oursCol.createEl("pre", {
+      cls: "gitsyncvault-conflict-version gitsyncvault-conflict-version-mine",
+    });
     oursPre.textContent =
       conflict.ours.slice(0, 2000) +
       (conflict.ours.length > 2000 ? "\n…(truncated)" : "");
@@ -80,10 +74,9 @@ export class ConflictModal extends Modal {
     // THEIRS
     const theirsCol = cols.createDiv();
     theirsCol.createEl("h4", { text: "Remote version (other device)" });
-    const theirsPre = theirsCol.createEl("pre");
-    theirsPre.style.cssText =
-      "background:#1a1a3a;padding:8px;border-radius:4px;" +
-      "overflow:auto;max-height:260px;font-size:11px;white-space:pre-wrap;";
+    const theirsPre = theirsCol.createEl("pre", {
+      cls: "gitsyncvault-conflict-version gitsyncvault-conflict-version-theirs",
+    });
     theirsPre.textContent =
       conflict.theirs.slice(0, 2000) +
       (conflict.theirs.length > 2000 ? "\n…(truncated)" : "");

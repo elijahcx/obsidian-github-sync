@@ -14,6 +14,7 @@ import { RemotePoller } from "./sync/remote-poller";
 import { DiagnosticsModal } from "./ui/diagnostics-modal";
 import { EMPTY_POLL_DIAGNOSTICS, EMPTY_QUEUE_DIAGNOSTICS, SyncDiagnostics } from "./diagnostics";
 import { classifySyncResult } from "./sync/result-classification";
+import { activateAfterStartupReconciliation, vaultPathForAdapter } from "./startup-lifecycle";
 
 export default class MultiSyncPlugin extends Plugin {
   settings!: PluginSettings;
@@ -28,6 +29,7 @@ export default class MultiSyncPlugin extends Plugin {
   private conflictModalOpen = false;
   private currentStatus: SyncStatus = "idle";
   private lastSuccessfulSyncAt: number | null = null;
+  private vaultEventListenersRegistered = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -61,27 +63,41 @@ export default class MultiSyncPlugin extends Plugin {
 
     // Pull on open — wait for workspace to be ready
     this.app.workspace.onLayoutReady(async () => {
-      if (this.gitSync) {
-        this.foregroundOperations++;
-        this.setStatus("pulling");
-        try {
-          const conflicts = await this.gitSync.pull();
-          if (conflicts.length > 0) {
-            this.presentConflicts(conflicts);
-          } else {
-            this.markSuccessfulSync(false);
-            this.setStatus("idle");
+      if (this.unloading) return;
+      // Keep listeners inactive while the startup pull materializes remote files.
+      // Otherwise its vault events can be mistaken for local user edits. Listener
+      // activation happens in finally so an offline startup still enables edits.
+      await activateAfterStartupReconciliation(async () => {
+        if (this.gitSync) {
+          this.foregroundOperations++;
+          this.setStatus("pulling");
+          try {
+            const conflicts = await this.gitSync.pull();
+            if (conflicts.length > 0) {
+              this.presentConflicts(conflicts);
+            } else {
+              this.markSuccessfulSync(false);
+              this.setStatus("idle");
+            }
+          } catch {
+            // Pull errors on open are non-fatal (e.g. offline) — just show error state
+            this.setStatus("error", "Pull failed on open");
+          } finally {
+            this.foregroundOperations--;
           }
-        } catch {
-          // Pull errors on open are non-fatal (e.g. offline) — just show error state
-          this.setStatus("error", "Pull failed on open");
-        } finally {
-          this.foregroundOperations--;
         }
-      }
+      }, () => {
+        if (!this.unloading) this.registerVaultEventListeners();
+      });
     });
+  }
 
-    // Watch file changes for auto-sync
+  private registerVaultEventListeners(): void {
+    if (this.vaultEventListenersRegistered) return;
+    this.vaultEventListenersRegistered = true;
+
+    // Watch runtime file changes for auto-sync. registerEvent() preserves the
+    // normal Obsidian unload cleanup for every listener.
     this.registerEvent(
       this.app.vault.on("modify", (file: TAbstractFile) => {
         if (!(file instanceof TFile)) return;
@@ -181,11 +197,7 @@ export default class MultiSyncPlugin extends Plugin {
     this.settings.repoName = repoName;
 
     const adapter = this.app.vault.adapter;
-    // Obsidian exposes basePath on FileSystemAdapter (desktop). On mobile the vault
-    // root is the adapter itself, so we fall back to an empty string which causes
-    // isomorphic-git to use relative paths from the adapter root.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const vaultPath: string = (adapter as any).basePath ?? "";
+    const vaultPath = vaultPathForAdapter(adapter);
 
     const sync = new GitSync(adapter, vaultPath, token, username, repoName, (p) =>
       this.isExcluded(p)
@@ -241,8 +253,7 @@ export default class MultiSyncPlugin extends Plugin {
 
     this.stopRemotePolling();
     const adapter = this.app.vault.adapter;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const vaultPath: string = (adapter as any).basePath ?? "";
+    const vaultPath = vaultPathForAdapter(adapter);
 
     this.gitSync = new GitSync(
       adapter,
@@ -296,7 +307,7 @@ export default class MultiSyncPlugin extends Plugin {
           return null;
         },
         () => this.pollRemote(),
-        (error) => console.debug("[git-sync] Passive remote poll failed; will retry", error),
+        () => undefined, // Transient failures are reflected in poll diagnostics.
         () => this.refreshDiagnostics()
       );
     }
@@ -481,7 +492,7 @@ export default class MultiSyncPlugin extends Plugin {
 }
 
 /**
- * DEBUG helper: show a scrollable log trace on-screen. Used because mobile has
+ * Show a scrollable sync log on-screen. Used because mobile has
  * no reachable dev console. Includes a Copy button so the trace can be shared.
  */
 function showLogModal(app: import("obsidian").App, header: string, logs: string[]): void {
@@ -489,18 +500,18 @@ function showLogModal(app: import("obsidian").App, header: string, logs: string[
   modal.titleEl.setText(header);
   const body = logs.join("\n");
 
-  const pre = modal.contentEl.createEl("pre");
-  pre.style.cssText =
-    "white-space:pre-wrap;word-break:break-all;font-family:monospace;" +
-    "font-size:12px;max-height:60vh;overflow:auto;user-select:text;" +
-    "background:var(--background-secondary);padding:8px;border-radius:6px;";
+  const pre = modal.contentEl.createEl("pre", { cls: "gitsyncvault-log-output" });
   pre.setText(body);
 
-  const btn = modal.contentEl.createEl("button", { text: "Copy" });
-  btn.style.marginTop = "8px";
-  btn.onclick = () => {
-    navigator.clipboard?.writeText(body);
-    new Notice("Log copied.");
+  const btn = modal.contentEl.createEl("button", { text: "Copy", cls: "gitsyncvault-log-copy" });
+  btn.onclick = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(body);
+      new Notice("Log copied.");
+    } catch {
+      new Notice("Could not copy log.");
+    }
   };
 
   modal.open();

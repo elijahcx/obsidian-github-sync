@@ -18,7 +18,7 @@ export class StatusBarItem {
 
   constructor(plugin: Plugin) {
     this.el = plugin.addStatusBarItem();
-    this.el.style.cursor = "pointer";
+    this.el.addClass("gitsyncvault-status-bar");
     this.set("idle");
   }
 

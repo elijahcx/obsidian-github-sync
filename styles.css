@@ -1,0 +1,93 @@
+.gitsyncvault-status-bar {
+  cursor: pointer;
+}
+
+.gitsyncvault-log-output {
+  max-height: 60vh;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.gitsyncvault-log-copy {
+  margin-top: 8px;
+}
+
+.gitsyncvault-diagnostics-output {
+  font-size: 12px;
+  white-space: pre-wrap;
+  user-select: text;
+}
+
+.gitsyncvault-conflict-diff {
+  max-height: 180px;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 4px;
+  background: var(--background-secondary);
+  font-size: 12px;
+}
+
+.gitsyncvault-conflict-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.gitsyncvault-conflict-version {
+  max-height: 260px;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-secondary);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+
+.gitsyncvault-conflict-version-mine {
+  border-inline-start: 3px solid var(--color-green);
+}
+
+.gitsyncvault-conflict-version-theirs {
+  border-inline-start: 3px solid var(--color-blue);
+}
+
+.gitsyncvault-device-flow {
+  margin-top: 12px;
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--background-secondary);
+  text-align: center;
+}
+
+.gitsyncvault-device-flow-link {
+  display: block;
+}
+
+.gitsyncvault-user-code {
+  display: inline-block;
+  margin: 12px auto;
+  padding: 8px 24px;
+  border: 2px solid var(--interactive-accent);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: 0.25em;
+}
+
+@media (max-width: 600px) {
+  .gitsyncvault-conflict-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
