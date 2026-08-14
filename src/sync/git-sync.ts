@@ -221,7 +221,8 @@ export class GitSync {
 
   /**
    * Fetch from origin. Returns the FETCH_HEAD oid when remote has commits,
-   * or null when the remote is empty or unreachable.
+   * or null when a reachable remote has no main branch. Genuine transport,
+   * authentication, permission, and repository errors set lastFetchError.
    */
   private async safeFetch(): Promise<string | null> {
     try {
@@ -235,12 +236,21 @@ export class GitSync {
       });
       if (res.fetchHead) return res.fetchHead;
 
-      // Fallback: read refs/remotes/origin/main (updated by fetch).
-      return await git.resolveRef({
-        fs: this.fs,
-        dir: this.dir,
-        ref: `refs/remotes/origin/${DEFAULT_BRANCH}`,
-      });
+      // The fetch itself completed successfully. A newly-created GitHub
+      // repository has no main branch and therefore no remote-tracking ref yet;
+      // that is an empty remote, not a fetch failure. The tracking-ref fallback
+      // is only needed for isomorphic-git versions that omit fetchHead despite
+      // updating refs/remotes/origin/main.
+      try {
+        return await git.resolveRef({
+          fs: this.fs,
+          dir: this.dir,
+          ref: `refs/remotes/origin/${DEFAULT_BRANCH}`,
+        });
+      } catch (error) {
+        if ((error as { code?: string }).code === "NotFoundError") return null;
+        throw error;
+      }
     } catch (e) {
       // Surface WHY fetch failed instead of silently swallowing it.
       const code = (e as { code?: string })?.code ?? "?";
@@ -646,7 +656,12 @@ export class GitSync {
 
       try {
         log(`step3 pushing attempt=${attempt} local=${short(localHead)} remote=${short(remoteHead)}`);
-        const pushRes = await git.push({ ...this.netOpts(), ref: DEFAULT_BRANCH, force: false });
+        const pushRes = await git.push({
+          ...this.netOpts(),
+          ref: DEFAULT_BRANCH,
+          remoteRef: DEFAULT_BRANCH,
+          force: false,
+        });
         log(`step3 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
         return [];
       } catch (e) {

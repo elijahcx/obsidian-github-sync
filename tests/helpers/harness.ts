@@ -84,6 +84,11 @@ export class GitHttpRemote {
   remotePath = "";
   url = "";
   private server?: ReturnType<typeof createServer>;
+  private failureStatus?: number;
+
+  setFailureStatus(status?: number): void {
+    this.failureStatus = status;
+  }
 
   async start(): Promise<void> {
     this.root = await mkdtemp(path.join(tmpdir(), "git-sync-tests-"));
@@ -118,6 +123,11 @@ export class GitHttpRemote {
   }
 
   private handle(req: IncomingMessage, res: ServerResponse): void {
+    if (this.failureStatus !== undefined) {
+      res.statusCode = this.failureStatus;
+      res.end(this.failureStatus === 401 ? "authentication required" : "repository not found");
+      return;
+    }
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const child = spawn("git", ["http-backend"], {
       env: {
