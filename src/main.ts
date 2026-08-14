@@ -11,8 +11,7 @@ import { persistResolutionMetadata } from "./sync/resolution-completion";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
 import { REMOTE_POLL_INTERVAL_MS } from "./constants";
 import { RemotePoller } from "./sync/remote-poller";
-import { DiagnosticsModal } from "./ui/diagnostics-modal";
-import { EMPTY_POLL_DIAGNOSTICS, EMPTY_QUEUE_DIAGNOSTICS, SyncDiagnostics } from "./diagnostics";
+import { classifySyncResult } from "./sync/result-classification";
 
 export default class MultiSyncPlugin extends Plugin {
   settings!: PluginSettings;
@@ -23,12 +22,9 @@ export default class MultiSyncPlugin extends Plugin {
   private unloading = false;
   private foregroundOperations = 0;
   private conflictActive = false;
-  private currentStatus: SyncStatus = "idle";
-  private lastSuccessfulSyncAt: number | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
-    this.lastSuccessfulSyncAt = this.settings.lastSyncTime || null;
 
     this.statusBar = new StatusBarItem(this);
     this.statusBar.onClick(() => this.triggerManualSync());
@@ -40,11 +36,6 @@ export default class MultiSyncPlugin extends Plugin {
       id: "sync-now",
       name: "Sync vault now",
       callback: () => this.triggerManualSync(),
-    });
-    this.addCommand({
-      id: "show-sync-diagnostics",
-      name: "Show sync diagnostics",
-      callback: () => new DiagnosticsModal(this.app, this.getDiagnostics()).open(),
     });
 
     // Boot sync engine if already connected
@@ -69,7 +60,6 @@ export default class MultiSyncPlugin extends Plugin {
             this.setStatus("conflict");
             this.showConflictModal(conflicts);
           } else {
-            this.markSuccessfulSync(false);
             this.setStatus("idle");
           }
         } catch {
@@ -161,9 +151,7 @@ export default class MultiSyncPlugin extends Plugin {
   }
 
   setStatus(status: SyncStatus, detail?: string): void {
-    this.currentStatus = status;
     this.statusBar.set(status, detail);
-    this.refreshDiagnostics();
   }
 
   /**
@@ -225,7 +213,7 @@ export default class MultiSyncPlugin extends Plugin {
       new Notice(`Reconnected to: ${username}/${repoName}`);
     }
 
-    this.markSuccessfulSync();
+    this.settings.lastSyncTime = Date.now();
     await this.saveSettings();
     await this.bootSyncEngine();
     this.setStatus("idle");
@@ -256,10 +244,10 @@ export default class MultiSyncPlugin extends Plugin {
     this.syncQueue = new SyncQueue(this.gitSync, (status, detail) => {
       this.setStatus(status, detail);
       if (status === "idle") {
-        this.markSuccessfulSync();
+        this.settings.lastSyncTime = Date.now();
         this.saveSettings();
       }
-    }, this.settings.syncIntervalMs, () => this.refreshDiagnostics());
+    }, this.settings.syncIntervalMs);
     this.updateRemotePolling();
   }
 
@@ -288,15 +276,11 @@ export default class MultiSyncPlugin extends Plugin {
           return timer;
         },
         (timer) => window.clearInterval(timer),
-        () => {
-          if (this.conflictActive || this.syncQueue?.getDiagnostics().conflictPaused) return "skipped-conflict";
-          if (this.foregroundOperations > 0) return "skipped-foreground-operation";
-          if (!this.syncQueue?.isIdleForRemotePull()) return "skipped-local-work";
-          return null;
-        },
+        () => !this.unloading && this.settings.autoSync && !!this.gitSync &&
+          this.foregroundOperations === 0 && !this.conflictActive &&
+          !!this.syncQueue?.isIdleForRemotePull(),
         () => this.pollRemote(),
-        (error) => console.debug("[git-sync] Passive remote poll failed; will retry", error),
-        () => this.refreshDiagnostics()
+        (error) => console.debug("[git-sync] Passive remote poll failed; will retry", error)
       );
     }
     this.remotePoller.start();
@@ -306,20 +290,16 @@ export default class MultiSyncPlugin extends Plugin {
     this.remotePoller?.stop();
   }
 
-  private async pollRemote(): Promise<"success" | "skipped-conflict"> {
+  private async pollRemote(): Promise<void> {
     const sync = this.gitSync;
-    if (!sync) return "success";
+    if (!sync) return;
     const conflicts = await sync.pull();
-    if (this.unloading || sync !== this.gitSync) return "success";
+    if (this.unloading || sync !== this.gitSync) return;
     if (conflicts.length > 0) {
       this.conflictActive = true;
       this.syncQueue?.pauseForConflict();
       this.setStatus("conflict");
       this.showConflictModal(conflicts);
-      return "skipped-conflict";
-    } else {
-      this.markSuccessfulSync(false);
-      return "success";
     }
   }
 
@@ -347,28 +327,26 @@ export default class MultiSyncPlugin extends Plugin {
         .filter((p) => !this.isExcluded(p));
 
       const result = await this.gitSync.syncAll(allFiles);
+      const outcome = classifySyncResult(result);
 
-      // DEBUG: show the full step-by-step trace on-screen (mobile has no console).
-      if (result.logs && result.logs.length) {
-        const header = result.success
-          ? "Sync OK"
-          : `Sync error: ${result.error ?? "unknown"}`;
-        showLogModal(this.app, header, result.logs);
-      }
-
-      if (result.conflictFiles.length > 0) {
+      // A conflict owns the UI until it is resolved or abandoned. In
+      // particular, do not leave a generic debug/error modal behind it for the
+      // same conflict-bearing result.
+      if (outcome.kind === "conflict") {
         this.conflictActive = true;
         this.syncQueue?.pauseForConflict();
         this.setStatus("conflict");
-        this.showConflictModal(result.conflictFiles);
-      } else if (result.success) {
+        this.showConflictModal(outcome.conflicts);
+      } else if (outcome.kind === "success") {
+        if (result.logs?.length) showLogModal(this.app, "Sync OK", result.logs);
         this.syncQueue?.resumeAfterConflict();
-        this.markSuccessfulSync();
+        this.settings.lastSyncTime = Date.now();
         await this.saveSettings();
         this.setStatus("idle");
         new Notice("Vault synced successfully.");
       } else {
-        this.setStatus("error", result.error);
+        if (result.logs?.length) showLogModal(this.app, `Sync error: ${outcome.message}`, result.logs);
+        this.setStatus("error", outcome.message);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -404,7 +382,7 @@ export default class MultiSyncPlugin extends Plugin {
         }
         if (result.completed) {
           this.conflictActive = false;
-          this.markSuccessfulSync();
+          this.settings.lastSyncTime = Date.now();
           this.setStatus("idle");
           new Notice("Conflicts resolved — vault synced.");
           this.syncQueue?.resumeAfterConflict();
@@ -437,32 +415,6 @@ export default class MultiSyncPlugin extends Plugin {
       const regexStr = escaped.replace(/\*/g, ".*");
       return new RegExp(`^${regexStr}$`).test(filepath);
     });
-  }
-
-  getDiagnostics(): SyncDiagnostics {
-    return {
-      version: this.manifest.version,
-      status: this.currentStatus,
-      connected: !!(this.gitSync && this.settings.githubUsername && this.settings.repoName),
-      githubUsername: this.settings.githubUsername,
-      repoName: this.settings.repoName,
-      autoSync: this.settings.autoSync,
-      debounceMs: this.settings.syncIntervalMs,
-      remoteIntervalMs: REMOTE_POLL_INTERVAL_MS,
-      lastSuccessfulSyncAt: this.lastSuccessfulSyncAt,
-      queue: this.syncQueue?.getDiagnostics() ?? { ...EMPTY_QUEUE_DIAGNOSTICS },
-      polling: this.remotePoller?.getDiagnostics() ?? { ...EMPTY_POLL_DIAGNOSTICS },
-    };
-  }
-
-  private markSuccessfulSync(persist = true): void {
-    this.lastSuccessfulSyncAt = Date.now();
-    if (persist) this.settings.lastSyncTime = this.lastSuccessfulSyncAt;
-    this.refreshDiagnostics();
-  }
-
-  private refreshDiagnostics(): void {
-    if (!this.unloading && this.statusBar) this.statusBar.setDiagnostics(this.getDiagnostics());
   }
 }
 

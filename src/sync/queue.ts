@@ -1,7 +1,8 @@
 import { SYNC_DEBOUNCE_MS } from "../constants";
 import { GitSync } from "./git-sync";
-import { QueueDiagnostics, SyncResult, SyncStatus } from "../types";
+import { SyncResult, SyncStatus } from "../types";
 import { normalizeGitPath } from "./paths";
+import { classifySyncResult } from "./result-classification";
 
 type StatusCallback = (status: SyncStatus, detail?: string) => void;
 
@@ -15,24 +16,20 @@ export class SyncQueue {
   private gitSync: GitSync;
   private onStatus: StatusCallback;
   private debounceMs: number;
-  private onDiagnosticsChange?: () => void;
 
   constructor(
     gitSync: GitSync,
     onStatus: StatusCallback,
-    debounceMs: number = SYNC_DEBOUNCE_MS,
-    onDiagnosticsChange?: () => void
+    debounceMs: number = SYNC_DEBOUNCE_MS
   ) {
     this.gitSync = gitSync;
     this.onStatus = onStatus;
     this.debounceMs = debounceMs;
-    this.onDiagnosticsChange = onDiagnosticsChange;
   }
 
   /** Enqueue a changed file path. Debounces before triggering sync. */
   enqueue(filepath: string): void {
     this.pendingFiles.add(normalizeGitPath(filepath));
-    this.changed();
     if (this.shuttingDown || this.conflictPaused) return;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.scheduleFlush();
@@ -61,10 +58,8 @@ export class SyncQueue {
     if (this.shuttingDown || this.conflictPaused) return;
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      this.changed();
       void this.flush();
     }, this.debounceMs);
-    this.changed();
   }
 
   /** Immediately drain the queue (used on vault close). */
@@ -86,7 +81,6 @@ export class SyncQueue {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
-    this.changed();
     const activeAtShutdown = this.activeFlush;
     this.shutdownPromise = (async () => {
       let timedOut = false;
@@ -119,12 +113,10 @@ export class SyncQueue {
     if (this.pendingFiles.size === 0) return null;
 
     this.activeFlush = this.flushBatch();
-    this.changed();
     try {
       return await this.activeFlush;
     } finally {
       this.activeFlush = null;
-      this.changed();
     }
   }
 
@@ -133,23 +125,21 @@ export class SyncQueue {
     let batchFailed = false;
     const filesToSync = [...this.pendingFiles];
     this.pendingFiles.clear();
-    this.changed();
 
     try {
       this.emitStatus("pushing");
       const result = await this.gitSync.sync(filesToSync);
+      const outcome = classifySyncResult(result);
 
-      if (result.conflictFiles.length > 0) {
+      if (outcome.kind === "conflict") {
         this.conflictPaused = true;
-        this.changed();
         this.emitStatus("conflict");
-      } else if (result.success) {
+      } else if (outcome.kind === "success") {
         this.emitStatus("idle");
       } else {
         batchFailed = true;
         for (const file of filesToSync) this.pendingFiles.add(file);
-        this.changed();
-        this.emitStatus("error", result.error);
+        this.emitStatus("error", outcome.message);
       }
 
       return result;
@@ -157,7 +147,6 @@ export class SyncQueue {
       batchFailed = true;
       const msg = err instanceof Error ? err.message : String(err);
       for (const file of filesToSync) this.pendingFiles.add(file);
-      this.changed();
       this.emitStatus("error", msg);
       return { success: false, conflictFiles: [], error: msg };
     } finally {
@@ -173,7 +162,6 @@ export class SyncQueue {
 
   resumeAfterConflict(): void {
     this.conflictPaused = false;
-    this.changed();
     if (this.pendingFiles.size > 0 && !this.shuttingDown) this.scheduleFlush();
   }
 
@@ -183,12 +171,10 @@ export class SyncQueue {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
-    this.changed();
   }
 
   supersedeConflictForManualSync(): void {
     this.conflictPaused = false;
-    this.changed();
   }
 
   private emitStatus(status: SyncStatus, detail?: string): void {
@@ -198,20 +184,5 @@ export class SyncQueue {
   /** Test/diagnostic visibility; pending failures are intentionally retained. */
   getPendingFiles(): string[] {
     return [...this.pendingFiles];
-  }
-
-  /** Immutable, filename-free runtime state for status and support UI. */
-  getDiagnostics(): QueueDiagnostics {
-    return {
-      pendingCount: this.pendingFiles.size,
-      active: this.activeFlush !== null,
-      debouncePending: this.debounceTimer !== null,
-      conflictPaused: this.conflictPaused,
-      shuttingDown: this.shuttingDown,
-    };
-  }
-
-  private changed(): void {
-    if (!this.shuttingDown) this.onDiagnosticsChange?.();
   }
 }

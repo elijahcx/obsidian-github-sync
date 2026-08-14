@@ -1,6 +1,5 @@
 import { Plugin } from "obsidian";
 import { SyncStatus } from "../types";
-import { buildStatusTooltip, SyncDiagnostics } from "../diagnostics";
 
 const STATUS_ICONS: Record<SyncStatus, string> = {
   idle:       "✓ Git Sync Vault",
@@ -10,8 +9,6 @@ const STATUS_ICONS: Record<SyncStatus, string> = {
   error:      "✗ Sync Error",
   connecting: "… Connecting",
 };
-
-export function statusLabel(status: SyncStatus): string { return STATUS_ICONS[status]; }
 
 export class StatusBarItem {
   private el: HTMLElement;
@@ -23,15 +20,9 @@ export class StatusBarItem {
   }
 
   set(status: SyncStatus, detail?: string): void {
-    const label = statusLabel(status);
-    // Details can contain transport or filesystem information; keep the public
-    // status surface compact and put only curated state in the tooltip.
-    this.el.setText(label);
+    const label = STATUS_ICONS[status];
+    this.el.setText(detail ? `${label}: ${detail}` : label);
     this.el.setAttribute("data-sync-status", status);
-  }
-
-  setDiagnostics(diagnostics: SyncDiagnostics): void {
-    this.el.setAttribute("title", buildStatusTooltip(diagnostics));
   }
 
   onClick(handler: () => void): void {

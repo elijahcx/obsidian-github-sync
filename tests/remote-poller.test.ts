@@ -25,18 +25,15 @@ function harness(options: { eligible?: boolean; poll?: () => Promise<void> } = {
   let eligible = options.eligible ?? true;
   let calls = 0;
   const errors: unknown[] = [];
-  let now = 1_000;
   const poller = new RemotePoller(
     REMOTE_POLL_INTERVAL_MS,
     clock.schedule,
     clock.clear,
-    () => eligible ? null : "skipped-local-work",
+    () => eligible,
     async () => { calls++; await options.poll?.(); },
-    (error) => errors.push(error),
-    () => {},
-    () => now
+    (error) => errors.push(error)
   );
-  return { clock, poller, errors, calls: () => calls, eligible: (value: boolean) => { eligible = value; }, advance: (ms: number) => { now += ms; } };
+  return { clock, poller, errors, calls: () => calls, eligible: (value: boolean) => { eligible = value; } };
 }
 
 test("polling starts once when connected with auto-sync enabled", () => {
@@ -45,10 +42,6 @@ test("polling starts once when connected with auto-sync enabled", () => {
   h.poller.start();
   assert.equal(h.clock.callbacks.size, 1);
   assert.deepEqual(h.clock.intervals, [15_000]);
-  assert.deepEqual(h.poller.getDiagnostics(), {
-    enabled: true, running: true, inFlight: false,
-    lastAttemptAt: null, lastSuccessAt: null, lastOutcome: null,
-  });
 });
 
 test("polling does not start when auto-sync is disabled by its lifecycle owner", () => {
@@ -82,7 +75,6 @@ test("only one passive pull can be active", async () => {
   h.poller.start();
   h.clock.fire();
   await turn();
-  assert.equal(h.poller.getDiagnostics().inFlight, true);
   h.clock.fire();
   await turn();
   assert.equal(h.calls(), 1);
@@ -100,7 +92,6 @@ test("active local sync and queued or debounced work skip the poll", async () =>
   h.clock.fire();
   await turn();
   assert.equal(h.calls(), 0);
-  assert.equal(h.poller.getDiagnostics().lastOutcome, "skipped-local-work");
   h.eligible(true);
   h.clock.fire();
   await turn();
@@ -150,32 +141,4 @@ test("transient and repeated offline failures are quiet and later ticks retry", 
   assert.equal(h.errors.length, 2);
   // Errors are delivered only to debug logging; the poller has no Notice/modal API.
   assert.equal(h.poller.isRunning(), true);
-  assert.equal(h.poller.getDiagnostics().lastOutcome, "success");
-  assert.equal(h.poller.getDiagnostics().lastSuccessAt, 1_000);
-});
-
-test("poll diagnostics record typed conflict and foreground skip reasons", async () => {
-  const clock = new FakeIntervals();
-  let reason: "skipped-conflict" | "skipped-foreground-operation" | null = "skipped-conflict";
-  const poller = new RemotePoller(15_000, clock.schedule, clock.clear, () => reason,
-    async () => {}, () => {});
-  poller.start();
-  clock.fire(); await turn();
-  assert.equal(poller.getDiagnostics().lastOutcome, "skipped-conflict");
-  reason = "skipped-foreground-operation";
-  clock.fire(); await turn();
-  assert.equal(poller.getDiagnostics().lastOutcome, "skipped-foreground-operation");
-  poller.stop();
-  assert.equal(poller.getDiagnostics().enabled, false);
-  assert.equal(poller.getDiagnostics().running, false);
-});
-
-test("a conflict returned by a poll is not recorded as a successful remote check", async () => {
-  const clock = new FakeIntervals();
-  const poller = new RemotePoller(15_000, clock.schedule, clock.clear, () => null,
-    async () => "skipped-conflict", () => {}, () => {}, () => 2_000);
-  poller.start();
-  clock.fire(); await turn();
-  assert.equal(poller.getDiagnostics().lastOutcome, "skipped-conflict");
-  assert.equal(poller.getDiagnostics().lastSuccessAt, null);
 });

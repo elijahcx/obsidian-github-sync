@@ -4,6 +4,7 @@ import { SYNC_DEBOUNCE_MS } from "../src/constants";
 import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename } from "../src/sync/events";
 import { SyncQueue } from "../src/sync/queue";
 import type { GitSync } from "../src/sync/git-sync";
+import type { SyncStatus } from "../src/types";
 import { normalizeGitPath, normalizeVaultPath } from "../src/sync/paths";
 import { createFsAdapter } from "../src/sync/fs-adapter";
 import { LocalAdapter } from "./helpers/harness";
@@ -134,31 +135,6 @@ test("SyncQueue preserves the default debounce value", () => {
   assert.equal(queue.getDebounceMs(), SYNC_DEBOUNCE_MS);
 });
 
-test("SyncQueue exposes an immutable filename-free diagnostic snapshot", async () => {
-  let release!: () => void;
-  const sync = { sync: async () => {
-    await new Promise<void>((resolve) => { release = resolve; });
-    return { success: true, conflictFiles: [] };
-  } } as unknown as GitSync;
-  const queue = new SyncQueue(sync, () => {}, 10_000);
-  queue.enqueue("private-note.md");
-  assert.deepEqual(queue.getDiagnostics(), {
-    pendingCount: 1, active: false, debouncePending: true,
-    conflictPaused: false, shuttingDown: false,
-  });
-  const flush = queue.flushNow();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(queue.getDiagnostics().active, true);
-  assert.equal("pendingFiles" in queue.getDiagnostics(), false);
-  release();
-  await flush;
-  queue.pauseForConflict();
-  assert.equal(queue.getDiagnostics().conflictPaused, true);
-  const shutdown = queue.shutdown();
-  assert.equal(queue.getDiagnostics().shuttingDown, true);
-  await shutdown;
-});
-
 test("SyncQueue uses a custom debounce value", async () => {
   const { queue, calls } = queueWithSync(10);
   queue.enqueue("note.md");
@@ -265,22 +241,25 @@ test("a failed unload flush keeps its batch discoverable", async () => {
 
 test("queue pauses after conflict, collects events, and resumes exactly once", async () => {
   const calls: string[][] = [];
+  const statuses: SyncStatus[] = [];
   const sync = { sync: async (files: string[]) => {
     calls.push(files);
     return calls.length === 1
       ? { success: false, conflictFiles: [{ path: "conflict.md" }] }
       : { success: true, conflictFiles: [] };
   } } as unknown as GitSync;
-  const queue = new SyncQueue(sync, () => {}, 5);
+  const queue = new SyncQueue(sync, (status) => { statuses.push(status); }, 5);
   queue.enqueue("conflict.md");
   await queue.flushNow();
   queue.enqueue("one.md");
   queue.enqueue("two.md");
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(calls.length, 1);
+  assert.equal(statuses.at(-1), "conflict");
   queue.resumeAfterConflict();
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(calls, [["conflict.md"], ["one.md", "two.md"]]);
+  assert.equal(statuses.at(-1), "idle");
 });
 
 test("shutdown fences enqueue, callbacks, repeated shutdown, and post-timeout drain", async () => {
