@@ -674,3 +674,65 @@ test("folder rename and deletion reconcile tracked descendants idempotently", as
     assert.equal(await git(["--git-dir", remote.remotePath, "ls-tree", "-r", "--name-only", "main"]), "");
   });
 });
+
+test("folder expansion preserves excluded descendants and avoids prefix collisions", async () => {
+  await withRemote({
+    "folder/a.md": "remove\n",
+    "folder/private/keep.md": "historical excluded\n",
+    "folder-old/keep.md": "prefix neighbor\n",
+  }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "folder-exclusions");
+    const internals = device.sync as unknown as { isExcluded: (path: string) => boolean };
+    internals.isExcluded = (path) => path.startsWith("folder/private/") || path.startsWith(".obsidian/");
+    await device.sync.clone();
+    await rm(path.join(device.dir, "folder"), { recursive: true });
+    const result = await device.sync.sync(["folder"]);
+    assert.equal(result.success, true, result.error);
+    await assert.rejects(git(["--git-dir", remote.remotePath, "show", "main:folder/a.md"]));
+    assert.equal(
+      await git(["--git-dir", remote.remotePath, "show", "main:folder/private/keep.md"]),
+      "historical excluded"
+    );
+    assert.equal(
+      await git(["--git-dir", remote.remotePath, "show", "main:folder-old/keep.md"]),
+      "prefix neighbor"
+    );
+  });
+});
+
+test("syncAll preserves zero-byte and binary files", async () => {
+  await withRemote({ "base.md": "base\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "full-binary");
+    await device.sync.clone();
+    await device.write("empty.md", "");
+    const binary = Buffer.from([0, 255, 1, 2, 0, 42]);
+    await device.writeBinary("assets/data.bin", binary);
+    const result = await device.sync.syncAll(["empty.md", "assets/data.bin", "base.md"]);
+    assert.equal(result.success, true, result.error);
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:empty.md"]), "");
+    const verifier = await makeDevice(remote.url, root, "full-binary-verifier");
+    await verifier.sync.clone();
+    assert.deepEqual(await verifier.readBinary("assets/data.bin"), binary);
+  });
+});
+
+test("failed conflict completion does not misleadingly leave an applicable old session", async () => {
+  await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
+    const a = await makeDevice(remote.url, root, "resolution-failure-a");
+    const b = await makeDevice(remote.url, root, "resolution-failure-b");
+    await a.sync.clone(); await b.sync.clone();
+    await a.write("note.md", "A\n"); await b.write("note.md", "B\n");
+    assert.equal((await a.sync.sync(["note.md"])).success, true);
+    const conflict = (await b.sync.sync(["note.md"])).conflictFiles[0];
+    const internals = b.sync as unknown as {
+      pushWithRetry: () => Promise<never>;
+    };
+    internals.pushWithRetry = async () => { throw new Error("push provider failed"); };
+    await assert.rejects(
+      b.sync.resolveConflict(conflict.path, conflict.ours, conflict.conflictSessionId),
+      /run Sync Now to refresh conflicts/
+    );
+    const stale = await b.sync.resolveConflict(conflict.path, conflict.ours, conflict.conflictSessionId);
+    assert.equal(stale.stale, true);
+  });
+});

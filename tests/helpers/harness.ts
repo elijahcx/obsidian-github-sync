@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile, readdir, unlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, lstat, writeFile, readdir, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -61,6 +61,18 @@ export class LocalAdapter {
     try {
       const s = await stat(this.abs(p));
       return { type: s.isFile() ? "file" : "folder", size: s.size, mtime: s.mtimeMs, ctime: s.ctimeMs };
+    } catch {
+      return null;
+    }
+  }
+
+  async lstat(p: string): Promise<{ type: "file" | "folder"; size: number; mtime: number; ctime: number; isSymbolicLink: boolean } | null> {
+    try {
+      const s = await lstat(this.abs(p));
+      return {
+        type: s.isDirectory() ? "folder" : "file", size: s.size,
+        mtime: s.mtimeMs, ctime: s.ctimeMs, isSymbolicLink: s.isSymbolicLink(),
+      };
     } catch {
       return null;
     }

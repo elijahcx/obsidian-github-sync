@@ -371,6 +371,13 @@ area is Git metadata and is never committed or pushed. If its journal is damaged
 or from an unsupported future version, synchronization stops without changing
 vault files and reports that manual recovery is required.
 
+Checkout recovery validates commit ancestry and changed paths and compares both
+bytes and provider metadata before materializing an interrupted merge. On
+desktop, automatic recovery also requires adapter support for checking symlink
+path components. Timestamps are not universally reliable across storage
+providers, so recovery refuses uncertain cases; an unavoidable edge remains when
+a provider reports unchanged metadata for a post-crash edit with identical bytes.
+
 ### Manual Sync guarantees
 
 **Sync vault now** performs a full reconciliation rather than replaying only
@@ -386,6 +393,11 @@ wrappers for the same physical vault serialize in one process. Mobile adapters
 expose an empty vault root and therefore use adapter identity. Normal plugin
 runtime reuses the vault adapter; third-party code creating multiple wrappers
 around the same mobile storage must not run concurrent GitSync instances.
+
+Plugin unload fences new queue work and waits up to ten seconds. isomorphic-git
+operations cannot be cancelled safely, so an operation already in progress may
+finish in the background after that deadline; no second operation is started by
+the shutting-down queue.
 
 ---
 

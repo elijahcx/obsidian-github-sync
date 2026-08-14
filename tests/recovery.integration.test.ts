@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { GitSync } from "../src/sync/git-sync";
 import { exclude, git, makeDevice, withRemote } from "./helpers/harness";
 
@@ -15,7 +15,7 @@ async function writeRecovery(
 ): Promise<void> {
   const directory = recoveryDir(dir);
   await mkdir(directory, { recursive: true });
-  const file = original === null ? undefined : "snapshot-0.bin";
+  const file = original === null ? undefined : "1700000000000-test-0.bin";
   if (file && original !== null) await writeFile(path.join(directory, file), original);
   await writeFile(path.join(directory, "journal.json"), JSON.stringify({
     version: 1,
@@ -160,11 +160,52 @@ test("startup removes only unreferenced recovery snapshot blobs", async () => {
     const device = await makeDevice(remote.url, root, "orphan-cleanup");
     await device.sync.clone();
     await mkdir(recoveryDir(device.dir), { recursive: true });
-    await writeFile(path.join(recoveryDir(device.dir), "orphan.bin"), "orphan");
+    await writeFile(path.join(recoveryDir(device.dir), "1700000000000-orphan-0.bin"), "orphan");
+    await writeFile(path.join(recoveryDir(device.dir), "user-backup.bin"), "preserve");
     await writeFile(path.join(recoveryDir(device.dir), "keep.txt"), "not a snapshot");
     assert.equal((await freshSync(device, remote.url).sync([])).success, true);
-    await assert.rejects(stat(path.join(recoveryDir(device.dir), "orphan.bin")));
+    await assert.rejects(stat(path.join(recoveryDir(device.dir), "1700000000000-orphan-0.bin")));
+    assert.equal(await readFile(path.join(recoveryDir(device.dir), "user-backup.bin"), "utf8"), "preserve");
     assert.equal(await readFile(path.join(recoveryDir(device.dir), "keep.txt"), "utf8"), "not a snapshot");
+  });
+});
+
+test("recovery cleanup propagates marker and snapshot deletion failures and remains restart-safe", async () => {
+  await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "cleanup-failures");
+    await device.sync.clone();
+    await device.write(".obsidian/workspace.json", "local\n");
+    const head = await git(["rev-parse", "main"], device.dir);
+    await writeRecovery(device.dir, ".obsidian/workspace.json", Buffer.from("local\n"), { local: head, remote: head });
+    const originalRemove = device.adapter.remove.bind(device.adapter);
+    let failJournal = true;
+    device.adapter.remove = async (filepath) => {
+      if (failJournal && filepath.endsWith("journal.json")) {
+        throw Object.assign(new Error("journal remove denied"), { code: "EACCES" });
+      }
+      return originalRemove(filepath);
+    };
+    await assert.rejects(freshSync(device, remote.url).sync([]), /journal remove denied/);
+    assert.equal(await device.read(".obsidian/workspace.json"), "local\n");
+    await stat(path.join(recoveryDir(device.dir), "journal.json"));
+    await stat(path.join(recoveryDir(device.dir), "1700000000000-test-0.bin"));
+
+    failJournal = false;
+    let failSnapshot = true;
+    device.adapter.remove = async (filepath) => {
+      if (failSnapshot && filepath.endsWith("1700000000000-test-0.bin")) {
+        throw Object.assign(new Error("snapshot remove denied"), { code: "EACCES" });
+      }
+      return originalRemove(filepath);
+    };
+    await assert.rejects(freshSync(device, remote.url).sync([]), /snapshot remove denied/);
+    await assert.rejects(stat(path.join(recoveryDir(device.dir), "journal.json")));
+    await stat(path.join(recoveryDir(device.dir), "1700000000000-test-0.bin"));
+
+    failSnapshot = false;
+    device.adapter.remove = originalRemove;
+    assert.equal((await freshSync(device, remote.url).sync([])).success, true);
+    await assert.rejects(stat(path.join(recoveryDir(device.dir), "1700000000000-test-0.bin")));
   });
 });
 
@@ -180,11 +221,26 @@ test("interrupted checkout is reconciled on restart only when working files stil
     const afterHead = await git(["rev-parse", "FETCH_HEAD"], device.dir);
     await git(["update-ref", "refs/heads/main", afterHead], device.dir);
     await device.write("note.md", "old\n");
+    const oldStats = await stat(path.join(device.dir, "note.md"));
+    const markerPath = { path: "note.md", existed: true, size: oldStats.size, mtimeMs: oldStats.mtimeMs };
     await mkdir(recoveryDir(device.dir), { recursive: true });
     await writeFile(path.join(recoveryDir(device.dir), "checkout.json"), JSON.stringify({
-      version: 1, beforeHead, afterHead, paths: ["note.md"],
+      version: 1, beforeHead, afterHead, paths: [markerPath],
     }));
 
+    const originalRemove = device.adapter.remove.bind(device.adapter);
+    let failMarkerRemoval = true;
+    device.adapter.remove = async (filepath) => {
+      if (failMarkerRemoval && filepath.endsWith("checkout.json")) {
+        throw Object.assign(new Error("checkout marker remove denied"), { code: "EACCES" });
+      }
+      return originalRemove(filepath);
+    };
+    await assert.rejects(freshSync(device, remote.url).sync([]), /checkout marker remove denied/);
+    assert.equal(await device.read("note.md"), "remote\n");
+    await stat(path.join(recoveryDir(device.dir), "checkout.json"));
+    failMarkerRemoval = false;
+    device.adapter.remove = originalRemove;
     const recovered = await freshSync(device, remote.url).sync([]);
     assert.equal(recovered.success, true, recovered.error);
     assert.equal(await device.read("note.md"), "remote\n");
@@ -192,7 +248,7 @@ test("interrupted checkout is reconciled on restart only when working files stil
 
     await device.write("note.md", "dirty user edit\n");
     await writeFile(path.join(recoveryDir(device.dir), "checkout.json"), JSON.stringify({
-      version: 1, beforeHead, afterHead, paths: ["note.md"],
+      version: 1, beforeHead, afterHead, paths: [markerPath],
     }));
     await assert.rejects(
       freshSync(device, remote.url).sync([]),
@@ -200,5 +256,78 @@ test("interrupted checkout is reconciled on restart only when working files stil
     );
     assert.equal(await device.read("note.md"), "dirty user edit\n");
     assert.equal(await git(["--git-dir", remote.remotePath, "rev-parse", "main"]), afterHead);
+  });
+});
+
+test("checkout marker rejects malformed, duplicate, unchanged, unrelated, oversized, and symlink content", async () => {
+  await withRemote({ "note.md": "old\n", "unchanged.md": "same\n", "dir/file.md": "old\n" }, async ({ remote, root }) => {
+    const source = await makeDevice(remote.url, root, "marker-source");
+    const device = await makeDevice(remote.url, root, "marker-device");
+    await source.sync.clone(); await device.sync.clone();
+    const beforeHead = await git(["rev-parse", "main"], device.dir);
+    await source.write("note.md", "new\n");
+    await source.write("dir/file.md", "new\n");
+    assert.equal((await source.sync.sync(["note.md", "dir/file.md"])).success, true);
+    await git(["fetch", remote.url, "main"], device.dir);
+    const afterHead = await git(["rev-parse", "FETCH_HEAD"], device.dir);
+    await git(["update-ref", "refs/heads/main", afterHead], device.dir);
+    const noteStats = await stat(path.join(device.dir, "note.md"));
+    const note = { path: "note.md", existed: true, size: noteStats.size, mtimeMs: noteStats.mtimeMs };
+    await mkdir(recoveryDir(device.dir), { recursive: true });
+    const marker = (value: unknown) => writeFile(
+      path.join(recoveryDir(device.dir), "checkout.json"), JSON.stringify(value)
+    );
+
+    await marker({ version: 1, beforeHead: "bad", afterHead, paths: [note] });
+    await assert.rejects(freshSync(device, remote.url).sync([]), /unsafe|invalid/i);
+    await marker({ version: 1, beforeHead, afterHead, paths: [note, note] });
+    await assert.rejects(freshSync(device, remote.url).sync([]), /duplicate/);
+    await marker({ version: 1, beforeHead, afterHead, paths: [{ ...note, path: "unchanged.md" }] });
+    await assert.rejects(freshSync(device, remote.url).sync([]), /unchanged/);
+
+    const tree = await git(["rev-parse", `${afterHead}^{tree}`], device.dir);
+    const unrelated = await git([
+      "-c", "user.name=Test", "-c", "user.email=test@example.com",
+      "commit-tree", tree, "-m", "unrelated",
+    ], device.dir);
+    await marker({ version: 1, beforeHead: unrelated, afterHead, paths: [note] });
+    await assert.rejects(freshSync(device, remote.url).sync([]), /unrelated/);
+
+    await writeFile(path.join(recoveryDir(device.dir), "checkout.json"), "x".repeat(1_000_001));
+    await assert.rejects(freshSync(device, remote.url).sync([]), /oversized/);
+
+    await marker({
+      version: 1, beforeHead, afterHead,
+      paths: [{ ...note, path: "dir/file.md" }],
+    });
+    await rm(path.join(device.dir, "dir"), { recursive: true });
+    await symlink(root, path.join(device.dir, "dir"), "dir");
+    await assert.rejects(freshSync(device, remote.url).sync([]), /symlink/);
+  });
+});
+
+test("checkout recovery handles added and deleted files", async () => {
+  await withRemote({ "deleted.md": "remove me\n" }, async ({ remote, root }) => {
+    const source = await makeDevice(remote.url, root, "add-delete-source");
+    const device = await makeDevice(remote.url, root, "add-delete-device");
+    await source.sync.clone(); await device.sync.clone();
+    const beforeHead = await git(["rev-parse", "main"], device.dir);
+    const deletedStats = await stat(path.join(device.dir, "deleted.md"));
+    await source.adapter.remove("deleted.md");
+    await source.write("added.md", "added\n");
+    assert.equal((await source.sync.sync(["deleted.md", "added.md"])).success, true);
+    await git(["fetch", remote.url, "main"], device.dir);
+    const afterHead = await git(["rev-parse", "FETCH_HEAD"], device.dir);
+    await git(["update-ref", "refs/heads/main", afterHead], device.dir);
+    await mkdir(recoveryDir(device.dir), { recursive: true });
+    await writeFile(path.join(recoveryDir(device.dir), "checkout.json"), JSON.stringify({
+      version: 1, beforeHead, afterHead, paths: [
+        { path: "added.md", existed: false, size: 0, mtimeMs: null },
+        { path: "deleted.md", existed: true, size: deletedStats.size, mtimeMs: deletedStats.mtimeMs },
+      ],
+    }));
+    assert.equal((await freshSync(device, remote.url).sync([])).success, true);
+    assert.equal(await device.read("added.md"), "added\n");
+    await assert.rejects(device.read("deleted.md"));
   });
 });

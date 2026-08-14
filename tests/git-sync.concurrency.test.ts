@@ -176,3 +176,27 @@ test("conflict resolution waits for an active sync", async () => {
     assert.deepEqual(starts, ["sync", "resolve"]);
   });
 });
+
+test("tracked descendant expansion scales by sorted prefix rather than repeated full scans", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "git-sync-prefix-index-"));
+  const sync = new GitSync(new LocalAdapter(dir) as never, dir, "token", "user", "repo");
+  const tracked = Array.from({ length: 20_000 }, (_, index) =>
+    `folder-${Math.floor(index / 20).toString().padStart(4, "0")}/file-${index % 20}.md`
+  );
+  const internals = sync as unknown as {
+    trackedPaths: () => Promise<string[]>;
+    expandChangedPaths: (paths: string[]) => Promise<string[]>;
+    fs: { promises: { stat: () => Promise<never> } };
+  };
+  internals.trackedPaths = async () => tracked;
+  internals.fs.promises.stat = async () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); };
+  try {
+    const folders = Array.from({ length: 1_000 }, (_, index) => `folder-${index.toString().padStart(4, "0")}`);
+    const started = Date.now();
+    const expanded = await internals.expandChangedPaths(folders);
+    assert.equal(expanded.length, 20_000);
+    assert.ok(Date.now() - started < 2_000);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

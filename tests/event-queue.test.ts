@@ -42,6 +42,27 @@ test("Windows-style absolute Git paths become relative only at the DataAdapter b
   }
 });
 
+test("fs adapter propagates provider unlink, readdir, and mkdir failures", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "adapter-errors-"));
+  try {
+    const adapter = new LocalAdapter(root);
+    const fs = createFsAdapter(adapter as never, root);
+    await fs.promises.unlink(path.join(root, "missing.md")); // proven ENOENT is harmless
+
+    await adapter.write("present.md", "keep");
+    adapter.remove = async () => { throw Object.assign(new Error("remove denied"), { code: "EACCES" }); };
+    await assert.rejects(fs.promises.unlink(path.join(root, "present.md")), /remove denied/);
+
+    adapter.list = async () => { throw Object.assign(new Error("provider offline"), { code: "EIO" }); };
+    await assert.rejects(fs.promises.readdir(root), /provider offline/);
+
+    adapter.mkdir = async () => { throw Object.assign(new Error("mkdir denied"), { code: "EACCES" }); };
+    await assert.rejects(fs.promises.mkdir(path.join(root, "new-folder")), /mkdir denied/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Windows-style rename and delete events enqueue POSIX Git paths", () => {
   const queue = recordingQueue();
   enqueueRename(queue, "folder\\old name.md", "folder\\new.name.md", excluded);
@@ -88,6 +109,10 @@ test("folder rename and delete enqueue recursive, normalized, exclusion-safe wor
   const movedIntoExcluded = recordingQueue();
   enqueueFolderRename(movedIntoExcluded, "notes", ".obsidian/notes", [".obsidian/notes/a.md"], excluded);
   assert.deepEqual(movedIntoExcluded.paths, ["notes", "notes/a.md"]);
+
+  const movedOutOfExcluded = recordingQueue();
+  enqueueFolderRename(movedOutOfExcluded, ".obsidian/notes", "notes", ["notes/a.md"], excluded);
+  assert.deepEqual(movedOutOfExcluded.paths, ["notes", "notes/a.md"]);
 });
 
 function queueWithSync(debounceMs?: number): { queue: SyncQueue; calls: string[][] } {
@@ -189,8 +214,9 @@ test("shutdown drains pending debounce and waits for an active flush without ove
     active--;
     return { success: true, conflictFiles: [] };
   } } as unknown as GitSync;
+  const idleQueue = new SyncQueue(sync, () => {}, 1000);
+  assert.equal(await idleQueue.shutdown(), null);
   const queue = new SyncQueue(sync, () => {}, 1000);
-  assert.equal(await queue.shutdown(), null); // idle
   queue.enqueue("a.md");
   const activeFlush = queue.flushNow();
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -210,4 +236,52 @@ test("a failed unload flush keeps its batch discoverable", async () => {
   const result = await queue.shutdown();
   assert.equal(result?.success, false);
   assert.deepEqual(queue.getPendingFiles(), ["offline.md"]);
+});
+
+test("queue pauses after conflict, collects events, and resumes exactly once", async () => {
+  const calls: string[][] = [];
+  const sync = { sync: async (files: string[]) => {
+    calls.push(files);
+    return calls.length === 1
+      ? { success: false, conflictFiles: [{ path: "conflict.md" }] }
+      : { success: true, conflictFiles: [] };
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 5);
+  queue.enqueue("conflict.md");
+  await queue.flushNow();
+  queue.enqueue("one.md");
+  queue.enqueue("two.md");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls.length, 1);
+  queue.resumeAfterConflict();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(calls, [["conflict.md"], ["one.md", "two.md"]]);
+});
+
+test("shutdown fences enqueue, callbacks, repeated shutdown, and post-timeout drain", async () => {
+  let release!: () => void;
+  let calls = 0;
+  let statuses = 0;
+  const sync = { sync: async () => {
+    calls++;
+    await new Promise<void>((resolve) => { release = resolve; });
+    return { success: true, conflictFiles: [] };
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => { statuses++; }, 5);
+  queue.enqueue("active.md");
+  const active = queue.flushNow();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const shutdownA = queue.shutdown(5);
+  const shutdownB = queue.shutdown(5);
+  queue.enqueue("after-shutdown.md");
+  const [a, b] = await Promise.all([shutdownA, shutdownB]);
+  assert.equal(a?.success, false);
+  assert.equal(b?.success, false);
+  assert.equal(calls, 1);
+  release();
+  await active;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls, 1);
+  assert.equal(statuses, 1); // pushing happened before shutdown; completion callback was fenced
+  assert.deepEqual(queue.getPendingFiles(), ["after-shutdown.md"]);
 });

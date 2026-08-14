@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ConflictModal, ResolveOutcome } from "../src/ui/conflict-modal";
 import type { ConflictChoice, ConflictFile } from "../src/types";
+import { persistResolutionMetadata } from "../src/sync/resolution-completion";
 
 type ModalInternals = {
   resolving: boolean;
@@ -71,4 +72,24 @@ test("a replacement conflict session closes the old modal without abandonment", 
   await replacement.modal.resolve(conflict, { exists: true, content: "ours" });
   assert.equal(replacement.closes(), 1);
   assert.equal(replacement.modal.completed, true);
+});
+
+test("settings persistence failure does not turn confirmed Git resolution into failure", async () => {
+  let reported = "";
+  await assert.doesNotReject(persistResolutionMetadata(
+    async () => { throw new Error("settings unavailable"); },
+    (error) => { reported = error instanceof Error ? error.message : String(error); }
+  ));
+  assert.equal(reported, "settings unavailable");
+
+  const modal = fakeModal(async () => {
+    await persistResolutionMetadata(
+      async () => { throw new Error("settings unavailable"); },
+      () => {}
+    );
+    return "accepted";
+  });
+  await modal.modal.resolve(conflict, { exists: true, content: "ours" });
+  assert.equal(modal.closes(), 1);
+  assert.equal(modal.modal.completed, true);
 });

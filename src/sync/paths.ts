@@ -25,5 +25,5 @@ export function isSafeRelativePath(filepath: unknown): filepath is string {
 }
 
 export function isSafeSnapshotBasename(filename: unknown): filename is string {
-  return typeof filename === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*\.bin$/.test(filename);
+  return typeof filename === "string" && /^\d{10,}-[a-z0-9]+-\d+\.bin$/.test(filename);
 }

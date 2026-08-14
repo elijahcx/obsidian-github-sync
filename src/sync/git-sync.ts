@@ -28,8 +28,10 @@ type CheckoutRecoveryJournal = {
   version: 1;
   beforeHead: string;
   afterHead: string;
-  paths: string[];
+  paths: Array<{ path: string; existed: boolean; size: number; mtimeMs: number | null }>;
 };
+const MAX_CHECKOUT_MARKER_BYTES = 1_000_000;
+const MAX_CHECKOUT_RECOVERY_PATHS = 10_000;
 
 /** A FIFO mutex shared by every GitSync instance using the same vault adapter. */
 class SyncMutex {
@@ -141,6 +143,7 @@ type PendingMerge = {
   /** Excluded conflicts resolved automatically from the remote commit tree. */
   excludedResolutions: Set<string>;
   binaryConflicts: Set<string>;
+  phase: "open" | "resolving";
 };
 
 export class GitSync {
@@ -411,6 +414,9 @@ export class GitSync {
       if ((error as { code?: string }).code === "ENOENT") return;
       throw error;
     }
+    if (raw.length > MAX_CHECKOUT_MARKER_BYTES) {
+      throw new Error("Checkout recovery marker is oversized; working files were not changed.");
+    }
     let marker: CheckoutRecoveryJournal;
     try {
       marker = JSON.parse(raw) as CheckoutRecoveryJournal;
@@ -421,8 +427,12 @@ export class GitSync {
       marker.version !== 1 ||
       !/^[0-9a-f]{40}$/.test(marker.beforeHead) ||
       !/^[0-9a-f]{40}$/.test(marker.afterHead) ||
-      !Array.isArray(marker.paths) ||
-      marker.paths.some((path) => !isSafeRelativePath(path) || this.isExcluded(path))
+      !Array.isArray(marker.paths) || marker.paths.length > MAX_CHECKOUT_RECOVERY_PATHS ||
+      marker.paths.some((entry) =>
+        !entry || typeof entry !== "object" || !isSafeRelativePath(entry.path) || this.isExcluded(entry.path) ||
+        typeof entry.existed !== "boolean" || !Number.isSafeInteger(entry.size) || entry.size < 0 ||
+        (entry.mtimeMs !== null && (!Number.isFinite(entry.mtimeMs) || entry.mtimeMs < 0))
+      )
     ) {
       throw new Error("Checkout recovery marker is unsafe; working files were not changed.");
     }
@@ -431,15 +441,54 @@ export class GitSync {
       throw new Error("Checkout recovery requires manual intervention because local HEAD changed.");
     }
 
+    try {
+      await Promise.all([
+        git.readCommit({ fs: this.fs, dir: this.dir, oid: marker.beforeHead }),
+        git.readCommit({ fs: this.fs, dir: this.dir, oid: marker.afterHead }),
+      ]);
+      const related = await git.isDescendent({
+        fs: this.fs, dir: this.dir, oid: marker.afterHead, ancestor: marker.beforeHead, depth: -1,
+      });
+      if (!related) throw new Error("unrelated commits");
+    } catch {
+      throw new Error("Checkout recovery marker commits are invalid or unrelated; working files were not changed.");
+    }
+
+    const changedPaths = new Set(await this.changedPathsBetween(marker.beforeHead, marker.afterHead));
+    const seen = new Set<string>();
+    for (const entry of marker.paths) {
+      if (seen.has(entry.path) || !changedPaths.has(entry.path)) {
+        throw new Error("Checkout recovery marker contains duplicate or unchanged paths; working files were not changed.");
+      }
+      seen.add(entry.path);
+      await this.assertNoSymlinkComponents(entry.path);
+    }
+
     const safeToCheckout: string[] = [];
-    for (const path of marker.paths) {
+    for (const entry of marker.paths) {
+      const path = entry.path;
       const working = await this.readWorkingFileIfPresent(path);
       const before = await this.readBlobBytesAtStrict(marker.beforeHead, path);
       const after = await this.readBlobBytesAtStrict(marker.afterHead, path);
       const equals = (value: Buffer | null, state: { exists: boolean; content: Uint8Array }) =>
         state.exists ? value !== null && value.equals(Buffer.from(state.content)) : value === null;
       if (equals(working, after)) continue;
-      if (equals(working, before)) safeToCheckout.push(path);
+      if (equals(working, before)) {
+        let currentStats: Awaited<ReturnType<typeof this.fs.promises.stat>> | null = null;
+        try {
+          currentStats = await this.fs.promises.stat(this.repoPath(path));
+        } catch (error) {
+          if ((error as { code?: string }).code !== "ENOENT") throw error;
+        }
+        const metadataMatches = entry.existed
+          ? currentStats?.isFile() === true && entry.mtimeMs !== null &&
+            currentStats.size === entry.size && currentStats.mtimeMs === entry.mtimeMs
+          : currentStats === null;
+        if (!metadataMatches) {
+          throw new Error(`Checkout recovery cannot prove local file is unchanged: ${path}`);
+        }
+        safeToCheckout.push(path);
+      }
       else throw new Error(`Checkout recovery stopped to preserve dirty local file: ${path}`);
     }
     if (safeToCheckout.length > 0) {
@@ -452,6 +501,24 @@ export class GitSync {
       });
     }
     await this.fs.promises.unlink(markerPath);
+  }
+
+  private async assertNoSymlinkComponents(path: string): Promise<void> {
+    if (this.dir !== "" && !this.fs.supportsSymlinkChecks) {
+      throw new Error("Checkout recovery cannot prove desktop path containment; manual recovery is required.");
+    }
+    const parts = path.split("/");
+    for (let index = 1; index <= parts.length; index++) {
+      const component = parts.slice(0, index).join("/");
+      try {
+        const stats = await this.fs.promises.lstat(this.repoPath(component));
+        if (stats.isSymbolicLink()) {
+          throw new Error(`Checkout recovery refuses symlink path component: ${component}`);
+        }
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error;
+      }
+    }
   }
 
   private async clearRecoveryJournal(journal: RecoveryJournal): Promise<void> {
@@ -677,7 +744,7 @@ export class GitSync {
 
   /** Expand a missing directory event to its tracked descendants. */
   private async expandChangedPaths(changedFiles: string[]): Promise<string[]> {
-    const tracked = await this.trackedPaths();
+    const tracked = (await this.trackedPaths()).sort();
     const expanded = new Set<string>();
     for (const input of changedFiles) {
       const path = normalizeGitPath(input);
@@ -692,9 +759,21 @@ export class GitSync {
         expanded.add(path);
       } catch (error) {
         if ((error as { code?: string }).code !== "ENOENT") throw error;
-        const descendants = tracked.filter((trackedPath) => trackedPath.startsWith(`${path}/`));
-        if (descendants.length > 0) descendants.forEach((trackedPath) => expanded.add(trackedPath));
-        else expanded.add(path);
+        const prefix = `${path}/`;
+        let low = 0;
+        let high = tracked.length;
+        while (low < high) {
+          const mid = (low + high) >>> 1;
+          if (tracked[mid] < prefix) low = mid + 1;
+          else high = mid;
+        }
+        let found = false;
+        for (let index = low; index < tracked.length && tracked[index].startsWith(prefix); index++) {
+          if (this.isExcluded(tracked[index])) continue;
+          expanded.add(tracked[index]);
+          found = true;
+        }
+        if (!found && !this.isExcluded(path)) expanded.add(path);
       }
     }
     return [...expanded];
@@ -716,6 +795,15 @@ export class GitSync {
     }
   }
 
+  private async preserveExcludedIndexEntries(): Promise<void> {
+    if (!(await this.hasLocalBranch())) return;
+    const head = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+    for (const path of await git.listFiles({ fs: this.fs, dir: this.dir, ref: head })) {
+      if (!this.isExcluded(path)) continue;
+      await git.resetIndex({ fs: this.fs, dir: this.dir, filepath: path, ref: head });
+    }
+  }
+
   private async syncUnlocked(changedFiles: string[]): Promise<SyncResult> {
     const logs: string[] = [];
     const log = (m: string) => { logs.push(m); console.log(`[git-sync] ${m}`); };
@@ -726,6 +814,7 @@ export class GitSync {
     try {
       // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
       const filesToStage = await this.expandChangedPaths(changedFiles);
+      await this.preserveExcludedIndexEntries();
       for (const file of filesToStage) {
         await this.stagePath(file);
       }
@@ -982,6 +1071,7 @@ export class GitSync {
         deletions,
         excludedResolutions: excludedPaths,
         binaryConflicts: new Set(),
+        phase: "open",
       };
 
       const conflicts: ConflictFile[] = [];
@@ -1034,26 +1124,26 @@ export class GitSync {
       const afterHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
       if (afterHead === beforeHead) return;
 
-      const [before, after] = await Promise.all([
-        git.listFiles({ fs: this.fs, dir: this.dir, ref: beforeHead }),
-        git.listFiles({ fs: this.fs, dir: this.dir, ref: afterHead }),
-      ]);
-
-      const changed: string[] = [];
-      for (const filepath of new Set([...before, ...after])) {
-        if (this.isExcluded(filepath)) continue;
-        const [a, b] = await Promise.all([
-          this.blobOidAt(beforeHead, filepath),
-          this.blobOidAt(afterHead, filepath),
-        ]);
-        if (a !== b) changed.push(filepath);
-      }
+      const changed = await this.changedPathsBetween(beforeHead, afterHead);
 
       if (changed.length === 0) return;
+      const paths: CheckoutRecoveryJournal["paths"] = [];
+      for (const path of changed) {
+        try {
+          const stats = await this.fs.promises.stat(this.repoPath(path));
+          paths.push({
+            path, existed: true, size: stats.size,
+            mtimeMs: Number.isFinite(stats.mtimeMs) && stats.mtimeMs > 0 ? stats.mtimeMs : null,
+          });
+        } catch (error) {
+          if ((error as { code?: string }).code !== "ENOENT") throw error;
+          paths.push({ path, existed: false, size: 0, mtimeMs: null });
+        }
+      }
       await this.fs.promises.mkdir(this.repoPath(RECOVERY_DIR), { recursive: true });
       await this.fs.promises.writeFile(
         this.repoPath(`${RECOVERY_DIR}/checkout.json`),
-        JSON.stringify({ version: 1, beforeHead, afterHead, paths: changed } satisfies CheckoutRecoveryJournal)
+        JSON.stringify({ version: 1, beforeHead, afterHead, paths } satisfies CheckoutRecoveryJournal)
       );
       await git.checkout({
         fs: this.fs,
@@ -1069,6 +1159,22 @@ export class GitSync {
       log(message);
       throw new Error(message);
     }
+  }
+
+  private async changedPathsBetween(beforeHead: string, afterHead: string): Promise<string[]> {
+    const [before, after] = await Promise.all([
+      git.listFiles({ fs: this.fs, dir: this.dir, ref: beforeHead }),
+      git.listFiles({ fs: this.fs, dir: this.dir, ref: afterHead }),
+    ]);
+    const changed: string[] = [];
+    for (const filepath of new Set([...before, ...after])) {
+      if (this.isExcluded(filepath)) continue;
+      const [a, b] = await Promise.all([
+        this.blobOidAt(beforeHead, filepath), this.blobOidAt(afterHead, filepath),
+      ]);
+      if (a !== b) changed.push(filepath);
+    }
+    return changed;
   }
 
   /**
@@ -1114,6 +1220,13 @@ export class GitSync {
         message: "This conflict session is stale. Please reopen the latest conflict prompt.",
       };
     }
+    if (pending.phase === "resolving") {
+      return {
+        completed: false,
+        stale: false,
+        message: "This conflict resolution is already in progress.",
+      };
+    }
 
     if (!(await this.isPendingMergeCurrent(pending))) {
       this.pendingMerge = null;
@@ -1133,8 +1246,9 @@ export class GitSync {
 
     // All decisions in — replay the merge, injecting the chosen content.
     const { ourHead, theirHead, resolutions, deletions, excludedResolutions, binaryConflicts } = pending;
-    this.pendingMerge = null;
+    pending.phase = "resolving";
 
+    try {
     if (deletions.size === 0 && excludedResolutions.size === 0 && binaryConflicts.size === 0) {
       // Content-only conflicts: let isomorphic-git build the merge tree via the
       // merge driver. This keeps the remote's non-conflicting changes intact.
@@ -1173,7 +1287,23 @@ export class GitSync {
     if (conflicts.length > 0) {
       return { completed: false, stale: false, conflictFiles: conflicts };
     }
+    if (this.pendingMerge === pending) this.pendingMerge = null;
     return { completed: true, stale: false };
+    } catch (error) {
+      let retryRequiresFreshSync = false;
+      if (this.pendingMerge === pending) {
+        if (await this.isPendingMergeCurrent(pending)) pending.phase = "open";
+        else {
+          this.pendingMerge = null;
+          retryRequiresFreshSync = true;
+        }
+      }
+      if (retryRequiresFreshSync) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`${message}. Repository state changed; run Sync Now to refresh conflicts.`);
+      }
+      throw error;
+    }
   }
 
   private async isPendingMergeCurrent(pending: PendingMerge): Promise<boolean> {

@@ -7,6 +7,7 @@ import { GitSync } from "./sync/git-sync";
 import { SyncQueue } from "./sync/queue";
 import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename } from "./sync/events";
 import { normalizeGitPath } from "./sync/paths";
+import { persistResolutionMetadata } from "./sync/resolution-completion";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
 
 export default class MultiSyncPlugin extends Plugin {
@@ -46,6 +47,7 @@ export default class MultiSyncPlugin extends Plugin {
         try {
           const conflicts = await this.gitSync.pull();
           if (conflicts.length > 0) {
+            this.syncQueue?.pauseForConflict();
             this.setStatus("conflict");
             this.showConflictModal(conflicts);
           } else {
@@ -237,6 +239,8 @@ export default class MultiSyncPlugin extends Plugin {
       return;
     }
 
+    this.syncQueue?.supersedeConflictForManualSync();
+
     this.setStatus("pulling");
     try {
       const allFiles = this.app.vault
@@ -255,9 +259,11 @@ export default class MultiSyncPlugin extends Plugin {
       }
 
       if (result.conflictFiles.length > 0) {
+        this.syncQueue?.pauseForConflict();
         this.setStatus("conflict");
         this.showConflictModal(result.conflictFiles);
       } else if (result.success) {
+        this.syncQueue?.resumeAfterConflict();
         this.settings.lastSyncTime = Date.now();
         await this.saveSettings();
         this.setStatus("idle");
@@ -282,6 +288,11 @@ export default class MultiSyncPlugin extends Plugin {
         if (result.stale) {
           this.setStatus("error", result.message);
           new Notice(result.message ?? "Conflict is stale. Please sync again.");
+          this.syncQueue?.resumeAfterConflict();
+          return "rejected";
+        }
+        if (result.message && !result.completed) {
+          new Notice(result.message);
           return "rejected";
         }
         if (result.conflictFiles?.length) {
@@ -291,17 +302,25 @@ export default class MultiSyncPlugin extends Plugin {
         }
         if (result.completed) {
           this.settings.lastSyncTime = Date.now();
-          await this.saveSettings();
           this.setStatus("idle");
           new Notice("Conflicts resolved — vault synced.");
+          this.syncQueue?.resumeAfterConflict();
+          await persistResolutionMetadata(() => this.saveSettings(), (error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`[git-sync] Conflict resolved, but settings could not be saved: ${message}`);
+            new Notice(`Vault synced, but sync time could not be saved: ${message}`);
+          });
         }
         return "accepted";
       },
       () => {
         // Dismissed without deciding everything: drop the pending merge so the
         // repo stays exactly as it was. The next sync will offer it again.
-        void this.gitSync?.abandonMerge(conflicts[0].conflictSessionId);
-        this.setStatus("idle");
+        void (async () => {
+          await this.gitSync?.abandonMerge(conflicts[0].conflictSessionId);
+          this.syncQueue?.resumeAfterConflict();
+          this.setStatus("idle");
+        })();
       }
     ).open();
   }

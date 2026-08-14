@@ -9,6 +9,9 @@ export class SyncQueue {
   private pendingFiles = new Set<string>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private activeFlush: Promise<SyncResult | null> | null = null;
+  private conflictPaused = false;
+  private shuttingDown = false;
+  private shutdownPromise: Promise<SyncResult | null> | null = null;
   private gitSync: GitSync;
   private onStatus: StatusCallback;
   private debounceMs: number;
@@ -26,6 +29,7 @@ export class SyncQueue {
   /** Enqueue a changed file path. Debounces before triggering sync. */
   enqueue(filepath: string): void {
     this.pendingFiles.add(normalizeGitPath(filepath));
+    if (this.shuttingDown || this.conflictPaused) return;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.scheduleFlush();
   }
@@ -44,6 +48,7 @@ export class SyncQueue {
   }
 
   private scheduleFlush(): void {
+    if (this.shuttingDown || this.conflictPaused) return;
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       void this.flush();
@@ -52,6 +57,7 @@ export class SyncQueue {
 
   /** Immediately drain the queue (used on vault close). */
   async flushNow(): Promise<SyncResult | null> {
+    if (this.shuttingDown) return null;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -62,28 +68,40 @@ export class SyncQueue {
 
   /** Coordinate plugin unload without launching work beside an active flush. */
   async shutdown(timeoutMs = 10_000): Promise<SyncResult | null> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shuttingDown = true;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
-    const drain = async () => {
-      if (this.activeFlush) await this.activeFlush;
-      return this.flush();
-    };
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<SyncResult>((resolve) => {
-      timer = setTimeout(() => resolve({
+    const activeAtShutdown = this.activeFlush;
+    this.shutdownPromise = (async () => {
+      let timedOut = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutResult: SyncResult = {
         success: false,
         conflictFiles: [],
         error: "Sync is still running during plugin unload; full reconciliation is required on next startup.",
-      }), timeoutMs);
-    });
-    const result = await Promise.race([drain(), timeout]);
-    if (timer) clearTimeout(timer);
-    return result;
+      };
+      const timeout = new Promise<SyncResult>((resolve) => {
+        timer = setTimeout(() => { timedOut = true; resolve(timeoutResult); }, timeoutMs);
+      });
+      if (activeAtShutdown) {
+        const activeResult = await Promise.race([activeAtShutdown, timeout]);
+        if (timedOut) return activeResult;
+      }
+      const result = this.pendingFiles.size > 0
+        ? await Promise.race([this.flush(true), timeout])
+        : activeAtShutdown ? await activeAtShutdown : null;
+      if (timer) clearTimeout(timer);
+      return result;
+    })();
+    return this.shutdownPromise;
   }
 
-  private async flush(): Promise<SyncResult | null> {
+  private async flush(duringShutdown = false): Promise<SyncResult | null> {
+    if (this.shuttingDown && !duringShutdown) return null;
+    if (this.conflictPaused && !duringShutdown) return null;
     if (this.activeFlush) return this.activeFlush;
     if (this.pendingFiles.size === 0) return null;
 
@@ -102,17 +120,18 @@ export class SyncQueue {
     this.pendingFiles.clear();
 
     try {
-      this.onStatus("pushing");
+      this.emitStatus("pushing");
       const result = await this.gitSync.sync(filesToSync);
 
       if (result.conflictFiles.length > 0) {
-        this.onStatus("conflict");
+        this.conflictPaused = true;
+        this.emitStatus("conflict");
       } else if (result.success) {
-        this.onStatus("idle");
+        this.emitStatus("idle");
       } else {
         batchFailed = true;
         for (const file of filesToSync) this.pendingFiles.add(file);
-        this.onStatus("error", result.error);
+        this.emitStatus("error", result.error);
       }
 
       return result;
@@ -120,17 +139,38 @@ export class SyncQueue {
       batchFailed = true;
       const msg = err instanceof Error ? err.message : String(err);
       for (const file of filesToSync) this.pendingFiles.add(file);
-      this.onStatus("error", msg);
+      this.emitStatus("error", msg);
       return { success: false, conflictFiles: [], error: msg };
     } finally {
       // If more files arrived while we were syncing, flush again
       // New events arriving during a successful/conflicted batch are drained.
       // Failed batches stay pending but require a later event, manual flush, or
       // unload flush to retry, avoiding an infinite offline retry loop.
-      if (this.pendingFiles.size > 0 && !batchFailed) {
+      if (this.pendingFiles.size > 0 && !batchFailed && !this.conflictPaused && !this.shuttingDown) {
         setTimeout(() => this.flush(), 500);
       }
     }
+  }
+
+  resumeAfterConflict(): void {
+    this.conflictPaused = false;
+    if (this.pendingFiles.size > 0 && !this.shuttingDown) this.scheduleFlush();
+  }
+
+  pauseForConflict(): void {
+    this.conflictPaused = true;
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+  }
+
+  supersedeConflictForManualSync(): void {
+    this.conflictPaused = false;
+  }
+
+  private emitStatus(status: SyncStatus, detail?: string): void {
+    if (!this.shuttingDown) this.onStatus(status, detail);
   }
 
   /** Test/diagnostic visibility; pending failures are intentionally retained. */
