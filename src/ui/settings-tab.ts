@@ -172,10 +172,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
       const deviceFlow = await requestDeviceCode(clientId);
 
       // Show the user their one-time code
-      const modal = this.containerEl.createDiv({ cls: "multisync-device-modal" });
-      modal.style.cssText =
-        "background:var(--background-secondary);border-radius:8px;padding:16px;" +
-        "margin-top:12px;text-align:center;";
+      const modal = this.containerEl.createDiv({ cls: "gitsyncvault-device-flow" });
       modal.createEl("p", {
         text: "Open this URL in your browser and enter the code below:",
       });
@@ -183,17 +180,11 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
         text: deviceFlow.verification_uri,
         href: deviceFlow.verification_uri,
       });
-      link.style.display = "block";
-      const codeEl = modal.createEl("h1", {
+      link.addClass("gitsyncvault-device-flow-link");
+      modal.createEl("h1", {
         text: deviceFlow.user_code,
-        cls: "multisync-user-code",
+        cls: "gitsyncvault-user-code",
       });
-      // Explicit styling so the code is visible regardless of Obsidian theme
-      codeEl.style.cssText =
-        "font-size:2rem;letter-spacing:0.25em;font-weight:700;" +
-        "color:var(--text-normal);background:var(--background-primary);" +
-        "border:2px solid var(--interactive-accent);border-radius:6px;" +
-        "padding:8px 24px;display:inline-block;margin:12px auto;font-family:monospace;";
       modal.createEl("p", {
         text: "Waiting for you to approve in the browser…",
         cls: "setting-item-description",

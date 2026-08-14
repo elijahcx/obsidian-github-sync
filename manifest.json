@@ -1,11 +1,10 @@
 {
   "id": "gitsyncvault",
   "name": "Git Sync Vault",
-  "version": "1.0.15",
+  "version": "1.0.16",
   "minAppVersion": "1.0.1",
   "description": "Safe cross-platform GitHub synchronization for Obsidian vaults.",
   "author": "Elijah",
   "authorUrl": "https://github.com/elijahcx",
-  "fundingUrl": "",
   "isDesktopOnly": false
 }

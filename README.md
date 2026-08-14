@@ -1,550 +1,190 @@
 # Git Sync Vault
 
-> Sync your Obsidian vault across every device using your own **free private GitHub repo**.  
-> No subscription. No cloud fees. Designed for Windows, macOS, Linux, iOS, and Android.
-> Currently validated in disposable-vault testing on macOS and Linux; Windows/mobile validation is ongoing.
+Git Sync Vault syncs an Obsidian vault between devices using a private GitHub
+repository you control. It automatically syncs local changes, checks for remote
+changes about every 15 seconds while Auto-sync is enabled, and pauses for your
+choice when the same file conflicts. No dedicated sync server or subscription is
+required.
 
 Git Sync Vault is based on the original [Git Sync project](https://github.com/livan116/github-valut-sync)
-by Livan Kumar. This fork has been substantially reworked and is maintained by
-Elijah ([elijahcx](https://github.com/elijahcx)), with improvements to multi-device
-synchronization, conflict handling, recovery, offline behavior, cross-platform
-reliability, and automated testing.
-
----
-
-## How It Works
-
-```
-Your GitHub Account
-        │
-        ├── obsidian-personal-notes  ← Vault 1 (all your devices sync here)
-        ├── obsidian-work-notes      ← Vault 2 (separate repo, same account)
-        └── obsidian-research        ← Vault 3 (separate repo, same account)
-
-Desktop  ──┐
-Mobile   ──┼──▶  obsidian-personal-notes  (same private GitHub repo)
-Laptop   ──┘
-```
-
-1. You connect your GitHub account once (in-browser, one approval click).
-2. The plugin auto-creates a **private repo** named after your vault.
-3. Every file save is automatically committed and pushed in the background.
-4. Every device pulls the latest changes when Obsidian opens.
-5. Conflicts are detected and shown with a side-by-side UI to resolve.
-
----
+by Livan Kumar. This substantially modified fork is maintained by
+[Elijah (`elijahcx`)](https://github.com/elijahcx).
 
 ## Features
 
-- **Works on all devices** — desktop and mobile via isomorphic-git (pure JS, no native binary)
-- **One GitHub account, multiple vaults** — each vault gets its own private repo
-- **Auto-sync** — local changes push silently after a short debounce, and remote changes are checked about every 15 seconds while enabled
-- **Pull on open** — always up-to-date when you open Obsidian
-- **Conflict resolution UI** — side-by-side view when two devices edit the same file
-- **Zero cost** — uses your own free GitHub repos, no server involved
-- **No data leaves your account** — all files go into your own private GitHub repo
+- Sync notes and attachments through your own private GitHub repository.
+- Auto-sync local changes after a configurable debounce (three seconds by default).
+- Check for remote changes about every 15 seconds while Auto-sync is enabled.
+- Retry later after temporary network failures or offline editing.
+- Pause and present choices for same-file conflicts.
+- Show current status and shareable, privacy-conscious diagnostics.
+- Use a cross-platform design without a native Git executable.
 
----
+## Platform status
 
-## Requirements
+Designed for Windows, macOS, Linux, iOS, and Android.
 
-- Obsidian **1.0.0** or later
-- A **free GitHub account** — [sign up at github.com](https://github.com/join) if you don't have one
-- Internet access for sync (offline edits are queued and synced when back online)
-- Node.js **18+** and npm (for building from source)
+Validated with disposable-vault testing on:
 
----
+- Windows
+- macOS
+- Linux
 
-## Part 1 — Developer Setup (Build from Source)
+Mobile validation is ongoing.
 
-### Prerequisites
+## Installation
 
-| Tool | Version | Install |
-|---|---|---|
-| Node.js | 18+ | https://nodejs.org |
-| npm | 9+ | Bundled with Node.js |
-| Git | any | https://git-scm.com |
+### Community Plugin directory
 
-### 1.1 — Clone the Repository
+Once Git Sync Vault is available in the Obsidian Community Plugin directory:
+
+1. Open **Settings → Community plugins → Browse**.
+2. Search for **Git Sync Vault**.
+3. Select **Install**, then **Enable**.
+
+Until then, use BRAT or a manual installation for testing.
+
+### BRAT
+
+1. Install [BRAT](https://github.com/TfTHacker/obsidian42-brat).
+2. In BRAT, choose **Add Beta Plugin**.
+3. Enter `https://github.com/elijahcx/obsidian-github-sync`.
+
+### Manual installation
+
+Download the matching release assets and copy them into
+`YourVault/.obsidian/plugins/gitsyncvault/`:
+
+- `main.js`
+- `manifest.json`
+- `styles.css`
+
+Restart Obsidian, then enable **Git Sync Vault** under **Settings → Community
+plugins**.
+
+## Setup
+
+Git Sync Vault connects directly to GitHub through your own GitHub account. There
+is no shared OAuth application or intermediary sync service.
+
+### 1. Create a GitHub OAuth App
+
+1. Open [GitHub Developer Settings](https://github.com/settings/developers), then
+   select **OAuth Apps → New OAuth App**.
+2. Choose an application name and provide valid homepage and callback URLs. Device
+   Flow does not use the callback URL, so `https://obsidian.md` can be used for
+   both URL fields.
+3. Register the application and enable **Device Flow** in its settings.
+4. Copy the **Client ID**.
+
+Only the Client ID is required. Do not create or enter a Client Secret. The same
+Client ID can be reused on each of your devices.
+
+### 2. Connect GitHub
+
+1. Open **Settings → Git Sync Vault**.
+2. Enter the OAuth **Client ID**.
+3. Enter the repository name you want to use, or leave it blank to derive one from
+   the vault name.
+4. Select **Connect GitHub**, then approve the Device Flow request in your browser.
+
+Git Sync Vault requests GitHub's `repo` scope so it can create and synchronize a
+private repository. The resulting access token is stored in this plugin's local
+Obsidian data and is used only for direct communication with GitHub.
+
+### 3. Choose the repository
+
+Use the same GitHub account and repository name for the same vault on every
+device. If the repository does not exist, the first device creates it as private.
+A later device using the same name connects to the existing repository. Use a
+different repository name for each separate vault.
+
+## How sync works
+
+- Local changes sync after the configured debounce, which defaults to three
+  seconds.
+- Remote changes are checked approximately every 15 seconds while Auto-sync is
+  enabled.
+- Opening the vault triggers startup reconciliation after Obsidian's workspace is
+  ready.
+- Temporary network failures leave work pending for a later retry.
+- Same-file conflicts pause synchronization until you resolve them.
+
+For an immediate full reconciliation, select the status bar item or run
+**Git Sync Vault: Sync vault now** from the Command Palette.
+
+## Conflicts
+
+When two devices independently edit the same content, Git Sync Vault pauses
+synchronization and presents a conflict dialog:
+
+- **Keep Mine** uses the version on the current device.
+- **Keep Theirs** uses the version received from the remote repository.
+- **Open in Editor** closes the dialog and opens the file so you can resolve it
+  manually.
+
+Review both versions before choosing. Synchronization remains paused while the
+conflict is unresolved.
+
+## Recommended exclusions
+
+The default exclusion is:
+
+```text
+.obsidian/*
+```
+
+This keeps device-specific Obsidian settings, workspace layout, plugin data, and
+installed plugin files local to each device. Keeping this exclusion is recommended
+for cross-device use. You may remove it if you intentionally want to synchronize
+Obsidian configuration and accept the additional conflict risk.
+
+Add other paths or `*` patterns under **Settings → Git Sync Vault → Excluded
+patterns**, one per line. Configure exclusions before the first sync when
+possible; adding an exclusion does not erase an already committed path from Git
+history.
+
+## Diagnostics
+
+Run **Git Sync Vault: Show sync diagnostics** from the Command Palette to inspect
+connection state, queue activity, remote polling, and recent outcomes. The dialog
+includes **Copy diagnostics** for sharing a report when requesting support.
+
+Diagnostics intentionally exclude OAuth tokens, note contents, filenames, and
+full vault paths.
+
+For bugs and support, open an issue in the
+[Git Sync Vault repository](https://github.com/elijahcx/obsidian-github-sync/issues).
+
+## Development
 
 ```bash
 git clone https://github.com/elijahcx/obsidian-github-sync.git
 cd obsidian-github-sync
-```
-
-### 1.2 — Install Dependencies
-
-```bash
 npm install
-```
-
-This installs:
-- `isomorphic-git` — pure-JS git engine (works on mobile, no native binaries)
-- `esbuild` — fast bundler
-- `typescript` — type definitions / optional type checking (not part of the build)
-- `obsidian` — type definitions only (not bundled)
-
-### 1.3 — Build the Plugin
-
-```bash
-# Development build (watch mode — rebuilds on every save)
-npm run dev
-
-# Production build (minified, no source maps)
+npm test
+npm run typecheck
 npm run build
 ```
 
-Both commands output a single `main.js` file in the project root. There are **no
-build-time secrets** — the GitHub OAuth Client ID is entered by each user in plugin
-settings at runtime (see [Part 3](#part-3--connecting-your-github-account)), so the
-build needs no `.env` or CI secret.
+The production build writes `main.js` in the repository root. See
+[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) for release and Community Plugin
+submission procedures.
 
-**Watch mode** (`npm run dev`) keeps running and rebuilds automatically as you edit source files. Leave it running while you test in Obsidian.
+## Migrating older test installations
 
-### 1.4 — Project Structure
+Disable any `git-obsi-sync` or `vaultgit-sync` test copy before installing this
+plugin under `.obsidian/plugins/gitsyncvault/`. Do not enable multiple identities
+at the same time. Settings from an older test identity are not migrated
+automatically.
 
-```
-obsidian-github-sync/
-├── src/
-│   ├── main.ts                   # Plugin entry point — wires everything together
-│   ├── types.ts                  # All TypeScript interfaces & types
-│   ├── constants.ts              # App-wide constants (URLs, branch, debounce)
-│   ├── auth/
-│   │   └── github-device.ts      # GitHub OAuth Device Flow (no server needed)
-│   ├── github/
-│   │   └── api.ts                # GitHub REST API wrapper (create repo, get user)
-│   ├── sync/
-│   │   ├── fs-adapter.ts         # Bridges Obsidian DataAdapter → isomorphic-git fs
-│   │   ├── git-sync.ts           # Core git operations: init / clone / pull / push
-│   │   ├── queue.ts              # Debounced sync queue with mutex (no race conditions)
-│   │   └── conflict.ts           # Conflict diff summary helper
-│   └── ui/
-│       ├── settings-tab.ts       # Plugin settings page
-│       ├── conflict-modal.ts     # Side-by-side conflict resolution modal
-│       └── status-bar.ts         # Live sync indicator in the status bar
-├── manifest.json                 # Obsidian plugin manifest
-├── package.json
-├── tsconfig.json
-├── esbuild.config.mjs
-└── main.js                       # Built output (git-ignored, generated by build)
-```
+## License & attribution
 
----
+Licensed under the [MIT License](LICENSE).
 
-## Part 2 — Installing the Plugin
+Git Sync Vault is based on the original **[Git Sync](https://github.com/livan116/github-valut-sync)**
+project by Livan Kumar. This substantially modified fork is maintained by
+[Elijah](https://github.com/elijahcx).
 
-> **Migrating a manual test installation:** Obsidian stores plugin settings under
-> the plugin ID. Disable the former `git-obsi-sync` copy (and any temporary
-> `vaultgit-sync` copy), close Obsidian, and install this build under
-> `.obsidian/plugins/gitsyncvault/`. Re-enter the connection settings for the new
-> identity, and do not enable multiple identities at the same time. Git Sync Vault
-> does not automatically copy or delete another plugin directory.
-
-### Option A — Manual Install from Build Output
-
-After running `npm run build`:
-
-1. Create the plugin folder inside your vault:
-   ```
-   YourVault/.obsidian/plugins/gitsyncvault/
-   ```
-2. Copy these two files into that folder:
-   ```
-   main.js
-   manifest.json
-   ```
-3. Open Obsidian → **Settings** → **Community plugins**
-4. Turn off **Restricted Mode** if prompted
-5. Find **Git Sync Vault** in the list → toggle it **ON**
-
-**Tip for development:** You can symlink the project directory directly into your vault's plugins folder so the built `main.js` is picked up automatically after each build:
-
-```bash
-# Windows (run as Administrator)
-mklink /D "C:\path\to\vault\.obsidian\plugins\gitsyncvault" "C:\path\to\obsidian-github-sync"
-
-# macOS / Linux
-ln -s /path/to/obsidian-github-sync /path/to/vault/.obsidian/plugins/gitsyncvault
-```
-
-### Option B — BRAT (Beta Testers)
-
-1. Install the [BRAT plugin](https://github.com/TfTHacker/obsidian42-brat) from Community Plugins.
-2. Open BRAT settings → **Add Beta Plugin**
-3. Paste the repo URL: `https://github.com/elijahcx/obsidian-github-sync`
-4. Click **Add Plugin** — BRAT installs it automatically.
-
----
-
-## Part 3 — Connecting Your GitHub Account
-
-> Do this on **every device** where you want sync. Use the **same GitHub account** each time.
-
-### Step 1 — Register a GitHub OAuth App (one-time)
-
-The plugin authenticates through **your own** GitHub OAuth App — there is no shared/built-in
-app, so you register one once and reuse its Client ID on every device.
-
-1. Go to [github.com/settings/developers](https://github.com/settings/developers) → **OAuth Apps** → **New OAuth App**.
-2. Fill in:
-
-   | Field | Value |
-   |---|---|
-   | Application name | Anything *except* a name containing "GitHub" (GitHub rejects those). It's just the label shown on the authorization screen. |
-   | Homepage URL | `https://obsidian.md` (any valid URL works) |
-   | Authorization callback URL | `https://obsidian.md` (placeholder — Device Flow doesn't use it) |
-
-3. **Register application**, then **enable Device Flow** on the app's settings page — the plugin will not work without it.
-4. Copy the **Client ID** (looks like `Ov23li…`). **Do not** create a Client Secret — Device Flow doesn't need one.
-
-### Step 2 — Enter the Client ID in Obsidian
-
-Go to **Settings** → **Git Sync Vault**, paste your Client ID into **GitHub OAuth Client ID**.
-
-### Step 3 — Click "Connect GitHub"
-
-You will see a screen like this:
-
-```
-┌─────────────────────────────────────────┐
-│  Open this URL in your browser:         │
-│  https://github.com/login/device        │
-│                                         │
-│           AB12-CD34                     │
-│                                         │
-│  Waiting for approval in browser…       │
-└─────────────────────────────────────────┘
-```
-
-Your browser will open automatically. If it doesn't, copy the URL manually.
-
-### Step 4 — Enter the Code in Your Browser
-
-1. The GitHub page asks: **"Enter the code shown in your app"**
-2. Type in the 8-character code (e.g. `AB12-CD34`)
-3. Click **Continue**
-4. Review what access the plugin requests: **private repos** (to create and sync your vault repo)
-5. Click **Authorize**
-
-### Step 5 — Done
-
-Back in Obsidian you'll see:
-
-```
-Connected as @your-github-username. Vault syncing started!
-```
-
-The plugin will:
-- **First device**: Create a new private repo named `obsidian-<your-vault-name>` and push all your files.
-- **Additional devices**: Detect the existing repo and clone it automatically.
-
----
-
-## Part 4 — Using the Plugin
-
-### Automatic Sync
-
-Once connected, the plugin runs silently in the background:
-
-| Event | What happens |
-|---|---|
-| You save / edit a file | Changes are committed and pushed after 3 seconds of inactivity |
-| You open Obsidian | Latest changes are pulled from GitHub |
-| You close Obsidian | Any pending changes are flushed and pushed |
-| Two devices edit same file | Conflict modal appears next time you open Obsidian |
-
-### Status Bar
-
-The bottom-right corner shows the current sync state:
-
-| Indicator | Meaning |
-|---|---|
-| `✓ Git Sync Vault` | All good, fully synced |
-| `↓ Syncing…` | Pulling from GitHub |
-| `↑ Syncing…` | Pushing to GitHub |
-| `⚠ Conflict` | Two devices edited the same file — action needed |
-| `✗ Sync Error` | Network or auth issue — hover for detail |
-
-Click the status bar item to trigger an **immediate manual sync** at any time.
-
-### Manual Sync
-
-- Click the status bar item, **or**
-- Open the Command Palette (`Ctrl/Cmd + P`) → search **"Sync vault now"**
-
----
-
-## Part 5 — Resolving Conflicts
-
-A conflict happens when the **same file** is edited on two devices before either has synced.
-
-When the plugin detects a conflict, a modal appears automatically:
-
-```
-┌──────────────────────────────────────────────────┐
-│  Sync Conflict (1 / 2)                           │
-│  File: notes/daily/2025-06-01.md                 │
-│                                                  │
-│  Changed lines:                                  │
-│  Line 4:                                         │
-│    - meeting at 3pm                              │
-│    + meeting at 4pm                              │
-│                                                  │
-│  YOUR VERSION        │  REMOTE VERSION           │
-│  ──────────────────  │  ─────────────────        │
-│  # June 1            │  # June 1                 │
-│  meeting at 3pm      │  meeting at 4pm           │
-│                                                  │
-│  [Keep Mine]  [Keep Theirs]  [Open in Editor]    │
-└──────────────────────────────────────────────────┘
-```
-
-| Button | Action |
-|---|---|
-| **Keep Mine** | Use the version from this device, discard remote changes |
-| **Keep Theirs** | Use the remote version, discard local changes |
-| **Open in Editor** | Close modal, open the file — edit it manually, then sync again |
-
-After resolving, the file is immediately committed and pushed.
-
----
-
-## Part 6 — Multiple Vaults
-
-Each vault gets its **own separate repo** automatically. There's nothing extra to configure.
-
-```
-Vault: "Personal Notes"   →  github.com/you/obsidian-personal-notes
-Vault: "Work"             →  github.com/you/obsidian-work
-Vault: "Research"         →  github.com/you/obsidian-research
-```
-
-On each device:
-1. Open the vault in Obsidian.
-2. Go to **Settings → Git Sync Vault** → connect your GitHub account.
-3. The plugin detects which vault is open and connects to the right repo automatically.
-
----
-
-## Part 7 — Settings Reference
-
-| Setting | Default | Description |
-|---|---|---|
-| **Auto-sync** | On | Sync local changes after the debounce and check for remote changes about every 15 seconds |
-| **Sync debounce** | 3000 ms | How long to wait after your last keystroke before syncing |
-| **Excluded patterns** | See below | Files/folders that will never be synced |
-
-### Default Excluded Patterns
-
-```
-.obsidian/workspace
-.obsidian/workspace.json
-.obsidian/plugins/*/data.json
-```
-
-These are excluded because they change frequently, are device-specific, and don't need to be shared.
-
-To add more exclusions, open **Settings → Git Sync Vault → Excluded patterns** and add one pattern per line. Wildcards (`*`) are supported.
-
-Example — exclude all files in a `Private` folder:
-```
-Private/*
-```
-
-If an excluded path was committed before it was excluded, the plugin keeps the
-remote version in Git history but never checks it out over the device-local copy.
-To stop tracking such paths in future commits without rewriting history, run this
-once from a desktop clone and push the resulting commit:
-
-```bash
-git rm -r --cached -- .obsidian
-git commit -m "chore: stop tracking device-local Obsidian files"
-git push origin main
-```
-
-`--cached` removes the paths only from Git's current tree; it leaves the local
-files on disk. Adjust `.obsidian` to the excluded path you want to untrack.
-
-### Cross-platform filename notes
-
-Git paths are stored with forward slashes on every platform, while the Obsidian
-adapter handles native filesystem paths. Case-only renames work when the host
-filesystem exposes both names distinctly. Because common macOS and Windows
-volumes are case-insensitive, perform case-only renames through an intermediate
-name (for example `note.md` → `note.tmp` → `Note.md`) if Obsidian does not emit the
-rename directly. CI runs on a case-sensitive Linux filesystem, so native macOS,
-Windows, and iOS filesystem-provider behavior still requires real-device testing.
-
-### Interrupted-operation recovery
-
-Before a merge can temporarily touch a historically tracked excluded file, the
-plugin stores a device-local snapshot and versioned journal under
-`.git/obsidian-sync-recovery/`. The next clone, sync, pull, or conflict action
-restores those local files before inspecting the current Git refs. This recovery
-area is Git metadata and is never committed or pushed. If its journal is damaged
-or from an unsupported future version, synchronization stops without changing
-vault files and reports that manual recovery is required.
-
-Checkout recovery validates commit ancestry and changed paths and compares both
-bytes and provider metadata before materializing an interrupted merge. On
-desktop, automatic recovery also requires adapter support for checking symlink
-path components. Timestamps are not universally reliable across storage
-providers, so recovery refuses uncertain cases; an unavoidable edge remains when
-a provider reports unchanged metadata for a post-crash edit with identical bytes.
-
-### Manual Sync guarantees
-
-**Sync vault now** performs a full reconciliation rather than replaying only
-captured Obsidian events. It compares current non-excluded vault files with the
-files tracked by local `main`, stages new and modified files, positively confirms
-missed deletions, then fetches, merges, and performs a verified non-forced push.
-Excluded paths such as `.obsidian/*` are not treated as local deletions even when
-they remain in historical Git trees. Filesystem/provider errors abort the full
-sync instead of being interpreted as absence.
-
-Desktop mutexes use the normalized vault root, so independently created adapter
-wrappers for the same physical vault serialize in one process. Mobile adapters
-expose an empty vault root and therefore use adapter identity. Normal plugin
-runtime reuses the vault adapter; third-party code creating multiple wrappers
-around the same mobile storage must not run concurrent GitSync instances.
-
-Plugin unload fences new queue work and waits up to ten seconds. isomorphic-git
-operations cannot be cancelled safely, so an operation already in progress may
-finish in the background after that deadline; no second operation is started by
-the shutting-down queue.
-
----
-
-## Troubleshooting
-
-### "Device code expired"
-The 8-character code has a 15-minute expiry. Click **Connect GitHub** again to get a fresh code.
-
-### "Access denied"
-You clicked **Cancel** on the GitHub authorization page. Click **Connect GitHub** to try again.
-
-### Sync shows `✗ Sync Error`
-1. Check your internet connection.
-2. Open **Settings → Git Sync Vault** — if disconnected, click **Connect GitHub** to re-authenticate.
-3. GitHub tokens occasionally expire — reconnecting issues a fresh token.
-
-### Files not appearing on second device
-1. Make sure you connected the **same GitHub account** on both devices.
-2. Check the status bar on both devices — both should show `✓ Git Sync Vault`.
-3. Trigger a manual sync on the device that has the new files (`Ctrl/Cmd + P` → "Sync vault now").
-
-### Mobile — "Cannot sync"
-- Ensure your mobile device has an internet connection.
-- The plugin uses Obsidian's built-in HTTP layer so it does not need special mobile permissions.
-- If syncing fails on mobile, try disconnecting and reconnecting your GitHub account.
-
-### `.git` folder visible in vault
-The `.git` folder is hidden in Obsidian by default. If you see it, go to  
-**Settings → Files & Links → Excluded files** and add `.git`.
-
-### Build fails with "Cannot find module 'obsidian'"
-Run `npm install` to install devDependencies. The `obsidian` package provides types only.
-
-### "Enter your GitHub OAuth App's Client ID before connecting"
-You haven't set a Client ID yet. Register an OAuth App with Device Flow enabled
-(see [Part 3 · Step 1](#step-1--register-a-github-oauth-app-one-time)) and paste its
-Client ID into **Settings → Git Sync Vault → GitHub OAuth Client ID**.
-
-### TypeScript errors after pulling
-Run `npm install` — a dependency may have been added. Then re-run `npm run build`.
-
----
-
-## FAQ
-
-**Q: Is my data private?**  
-A: Yes. The plugin creates a **private** GitHub repo. Only your GitHub account can access it.
-
-**Q: Does the plugin developer see my notes?**  
-A: No. The plugin runs entirely on your device and connects directly to your own GitHub account. There is no intermediate server.
-
-**Q: What happens if I edit the same file on two offline devices?**  
-A: When both devices come online, the plugin detects the conflict and shows you the resolution modal.
-
-**Q: Can I use this with an existing vault that already has files?**  
-A: Yes. On first connection, the plugin pushes all your existing files to the new GitHub repo.
-
-**Q: Does this work with Obsidian's built-in sync?**  
-A: It's designed to replace, not complement, Obsidian Sync. Using both at once is not recommended as they may conflict.
-
-**Q: What is the storage limit?**  
-A: GitHub repos have a soft limit of 1 GB per repo. A typical Obsidian vault of markdown files is well under 100 MB.
-
-**Q: Can I view my notes on GitHub directly?**  
-A: Yes — GitHub renders Markdown files beautifully. Browse your private repo at `github.com/your-github-username/obsidian-<vaultname>`.
-
-**Q: Why does the plugin need the `repo` OAuth scope?**  
-A: The `repo` scope is the minimum required to create and push to **private** repositories. Without it GitHub only allows access to public repos.
-
----
-
-## Privacy & Security
-
-- Your GitHub **access token** is stored only in Obsidian's local plugin data folder (`.obsidian/plugins/gitsyncvault/data.json`) on each device. It never leaves your device except to communicate directly with GitHub's API.
-- The plugin requests only the **`repo` scope** — the minimum required to create and access private repositories.
-- To revoke access at any time: GitHub → Settings → Applications → Authorized OAuth Apps → **Revoke**.
-
----
-
-## Architecture Notes (for Contributors)
-
-| Concern | Solution | Why |
-|---|---|---|
-| Auth | GitHub OAuth Device Flow | No server or callback URL needed |
-| Storage | User's own private GitHub repo | Free, private, version-controlled |
-| Sync engine | isomorphic-git (pure JS) | Works on iOS/Android — no native binaries |
-| File system | Custom adapter wrapping DataAdapter | Obsidian's API works on all platforms |
-| HTTP | Obsidian's `requestUrl` API | Bypasses CORS, works on mobile |
-
-**Key constraints:**
-- Never use `require('fs')` — always use the `fs-adapter` so mobile works.
-- Always pull before push — enforced in `git-sync.ts::sync()`.
-- Always use `requestUrl` from obsidian for HTTP — never `fetch` or `axios`.
-- Never store the GitHub token anywhere other than `this.saveData()`.
-
----
-
-## Contributing
-
-Pull requests welcome!
-
-```bash
-# 1. Fork and clone
-git clone https://github.com/elijahcx/obsidian-github-sync.git
-cd obsidian-github-sync
-
-# 2. Install deps
-npm install
-
-# 3. Start watch mode (no .env / secret needed — Client ID is entered at runtime)
-npm run dev
-
-# 4. Symlink into your test vault (see Part 2 above)
-# 5. Make your changes — Obsidian hot-reloads the plugin automatically
-# 6. Run a type check before submitting
-npx tsc --noEmit
-```
-
-For bugs and feature requests, open an [issue](https://github.com/elijahcx/obsidian-github-sync/issues).
-
----
-
-## Credits and origin
-
-Git Sync Vault is derived from [Git Sync](https://github.com/livan116/github-valut-sync),
-originally created by Livan Kumar. This fork contains substantial modifications and
-is maintained by Elijah ([elijahcx](https://github.com/elijahcx)). The fork is an
-independent continuation and does not imply endorsement by the original author.
-
-The original MIT license and copyright notice are preserved in [LICENSE](LICENSE).
-
----
-
-## License
-
-MIT © 2025 Livan Kumar
+The [LICENSE](LICENSE) file remains authoritative for copyright notices and
+license terms.
