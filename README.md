@@ -37,7 +37,7 @@ Laptop   ──┘
 
 - **Works on all devices** — desktop and mobile via isomorphic-git (pure JS, no native binary)
 - **One GitHub account, multiple vaults** — each vault gets its own private repo
-- **Auto-sync** — changes push silently in the background after a short debounce
+- **Auto-sync** — local changes push silently after a short debounce, and remote changes are checked about every 45 seconds while enabled
 - **Pull on open** — always up-to-date when you open Obsidian
 - **Conflict resolution UI** — side-by-side view when two devices edit the same file
 - **Zero cost** — uses your own free GitHub repos, no server involved
@@ -329,7 +329,7 @@ On each device:
 
 | Setting | Default | Description |
 |---|---|---|
-| **Auto-sync** | On | Automatically sync on file changes |
+| **Auto-sync** | On | Sync local changes after the debounce and check for remote changes about every 45 seconds |
 | **Sync debounce** | 3000 ms | How long to wait after your last keystroke before syncing |
 | **Excluded patterns** | See below | Files/folders that will never be synced |
 

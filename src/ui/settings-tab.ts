@@ -34,6 +34,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
               settings.githubToken = "";
               settings.githubUsername = "";
               settings.repoName = "";
+              this.plugin.disconnectSyncEngine();
               await this.plugin.saveSettings();
               this.display();
               new Notice("Disconnected from GitHub.");
@@ -99,7 +100,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
       .setDesc("Automatically sync when files are modified.")
       .addToggle((toggle) =>
         toggle.setValue(settings.autoSync).onChange(async (val) => {
-          settings.autoSync = val;
+          this.plugin.updateAutoSync(val);
           await this.plugin.saveSettings();
         })
       );

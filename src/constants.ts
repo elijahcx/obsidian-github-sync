@@ -10,6 +10,7 @@ export const GIT_AUTHOR_NAME   = "Git Sync Vault";
 export const GIT_AUTHOR_EMAIL  = "sync@obsidian.local";
 export const GIT_DIR           = ".git";
 export const SYNC_DEBOUNCE_MS  = 3000;
+export const REMOTE_POLL_INTERVAL_MS = 45_000;
 export const SYNC_ON_OPEN      = true;
 export const SYNC_ON_CLOSE     = true;
 export const DEFAULT_BRANCH    = "main";

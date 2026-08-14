@@ -29,6 +29,23 @@ test("sequential happy path syncs changes in both directions", async () => {
   });
 });
 
+test("pull refuses to overwrite dirty local work when the remote advanced", async () => {
+  await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
+    const local = await makeDevice(remote.url, root, "dirty-pull-local");
+    const other = await makeDevice(remote.url, root, "dirty-pull-other");
+    await local.sync.clone();
+    await other.sync.clone();
+
+    await local.write("note.md", "unsynced local\n");
+    await other.write("note.md", "remote update\n");
+    assert.equal((await other.sync.sync(["note.md"])).success, true);
+
+    await assert.rejects(local.sync.pull(), /Local working changes prevent pull: note\.md/);
+    assert.equal(await local.read("note.md"), "unsynced local\n");
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:note.md"]), "remote update");
+  });
+});
+
 test("reproduces and recovers from non-fast-forward race after both devices fetch the same stale remote", async () => {
   await withRemote({ "base.md": "base\n" }, async ({ remote, root }) => {
     const a = await makeDevice(remote.url, root, "device-a");
