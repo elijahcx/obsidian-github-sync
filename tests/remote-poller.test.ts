@@ -41,7 +41,7 @@ test("polling starts once when connected with auto-sync enabled", () => {
   h.poller.start();
   h.poller.start();
   assert.equal(h.clock.callbacks.size, 1);
-  assert.deepEqual(h.clock.intervals, [45_000]);
+  assert.deepEqual(h.clock.intervals, [15_000]);
 });
 
 test("polling does not start when auto-sync is disabled by its lifecycle owner", () => {
