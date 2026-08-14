@@ -1,7 +1,8 @@
 # Git Sync Vault
 
 > Sync your Obsidian vault across every device using your own **free private GitHub repo**.  
-> No subscription. No cloud fees. Works on desktop (Windows / macOS / Linux) and mobile (iOS / Android).
+> No subscription. No cloud fees. Designed for Windows, macOS, Linux, iOS, and Android.
+> Currently validated in disposable-vault testing on macOS and Linux; Windows/mobile validation is ongoing.
 
 Git Sync Vault is based on the original [Git Sync project](https://github.com/livan116/github-valut-sync)
 by Livan Kumar. This fork has been substantially reworked and is maintained by

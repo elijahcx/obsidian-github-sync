@@ -133,7 +133,7 @@ test("non-fast-forward followed by a merge conflict returns existing conflict pa
   });
 });
 
-test("resolving a valid active conflict session succeeds", async () => {
+test("Keep Theirs resolves cleanly and clears its session only after completion", async () => {
   await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
     const a = await makeDevice(remote.url, root, "device-a");
     const b = await makeDevice(remote.url, root, "device-b");
@@ -148,9 +148,14 @@ test("resolving a valid active conflict session succeeds", async () => {
     assert.equal(conflict.success, false);
     const [file] = conflict.conflictFiles;
     assert.ok(file.conflictSessionId);
+    const internals = b.sync as never as { pendingMerge: unknown };
+    assert.notEqual(internals.pendingMerge, null);
 
     const resolved = await b.sync.resolveConflict(file.path, file.theirs, file.conflictSessionId);
     assert.deepEqual(resolved, { completed: true, stale: false });
+    assert.equal(await b.read("note.md"), "A edit\n");
+    assert.equal(await git(["status", "--porcelain"], b.dir), "");
+    assert.equal(internals.pendingMerge, null);
 
     const verifier = await makeDevice(remote.url, root, "verifier");
     assert.equal(await verifier.sync.clone(), true);
@@ -158,7 +163,7 @@ test("resolving a valid active conflict session succeeds", async () => {
   });
 });
 
-test("conflict resolution pushes once without retry when the remote has not advanced", async () => {
+test("Keep Mine resolves cleanly, clears its session, and pushes without retry", async () => {
   await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
     const a = await makeDevice(remote.url, root, "device-a");
     const b = await makeDevice(remote.url, root, "device-b");
@@ -170,7 +175,8 @@ test("conflict resolution pushes once without retry when the remote has not adva
     assert.equal((await a.sync.sync(["note.md"])).success, true);
     const conflict = (await b.sync.sync(["note.md"])).conflictFiles[0];
 
-    const internals = b.sync as never as { safeFetch: () => Promise<string | null> };
+    const internals = b.sync as never as { safeFetch: () => Promise<string | null>; pendingMerge: unknown };
+    assert.notEqual(internals.pendingMerge, null);
     const realFetch = internals.safeFetch.bind(b.sync);
     let retryFetches = 0;
     internals.safeFetch = async () => {
@@ -181,6 +187,13 @@ test("conflict resolution pushes once without retry when the remote has not adva
     const result = await b.sync.resolveConflict(conflict.path, conflict.ours, conflict.conflictSessionId);
     assert.deepEqual(result, { completed: true, stale: false });
     assert.equal(retryFetches, 0);
+    assert.equal(await b.read("note.md"), "B edit\n");
+    assert.equal(await git(["status", "--porcelain"], b.dir), "");
+    assert.equal(internals.pendingMerge, null);
+
+    const verifier = await makeDevice(remote.url, root, "verifier-mine");
+    assert.equal(await verifier.sync.clone(), true);
+    assert.equal(await verifier.read("note.md"), "B edit\n");
   });
 });
 
