@@ -58,6 +58,31 @@ export type SyncStatus =
   | "error"
   | "connecting";
 
+export type RemotePollOutcome =
+  | "success"
+  | "no-change"
+  | "skipped-local-work"
+  | "skipped-conflict"
+  | "skipped-foreground-operation"
+  | "offline/error";
+
+export interface QueueDiagnostics {
+  pendingCount: number;
+  active: boolean;
+  debouncePending: boolean;
+  conflictPaused: boolean;
+  shuttingDown: boolean;
+}
+
+export interface RemotePollDiagnostics {
+  enabled: boolean;
+  running: boolean;
+  inFlight: boolean;
+  lastAttemptAt: number | null;
+  lastSuccessAt: number | null;
+  lastOutcome: RemotePollOutcome | null;
+}
+
 export interface ConflictFile {
   conflictSessionId: string; // unique token for the merge/conflict state that produced this file
   path: string;

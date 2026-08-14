@@ -134,6 +134,31 @@ test("SyncQueue preserves the default debounce value", () => {
   assert.equal(queue.getDebounceMs(), SYNC_DEBOUNCE_MS);
 });
 
+test("SyncQueue exposes an immutable filename-free diagnostic snapshot", async () => {
+  let release!: () => void;
+  const sync = { sync: async () => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    return { success: true, conflictFiles: [] };
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 10_000);
+  queue.enqueue("private-note.md");
+  assert.deepEqual(queue.getDiagnostics(), {
+    pendingCount: 1, active: false, debouncePending: true,
+    conflictPaused: false, shuttingDown: false,
+  });
+  const flush = queue.flushNow();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(queue.getDiagnostics().active, true);
+  assert.equal("pendingFiles" in queue.getDiagnostics(), false);
+  release();
+  await flush;
+  queue.pauseForConflict();
+  assert.equal(queue.getDiagnostics().conflictPaused, true);
+  const shutdown = queue.shutdown();
+  assert.equal(queue.getDiagnostics().shuttingDown, true);
+  await shutdown;
+});
+
 test("SyncQueue uses a custom debounce value", async () => {
   const { queue, calls } = queueWithSync(10);
   queue.enqueue("note.md");
