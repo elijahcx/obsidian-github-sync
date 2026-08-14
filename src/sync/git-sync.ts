@@ -1489,14 +1489,31 @@ export class GitSync {
   private async pullUnlocked(): Promise<ConflictFile[]> {
     if (!(await this.hasLocalBranch())) return [];
 
+    // A pull may fast-forward and check out files. Never let that happen over
+    // unstaged/staged local work; the queue or a later manual sync must protect
+    // and commit those changes first.
+    await this.assertCleanForPull();
+
     this.lastFetchError = null;
     const fetchHead = await this.safeFetch();
+    // Files can change while the network request is in flight. Re-check while
+    // still holding the vault mutex before mergeRemote can materialize a tree.
+    await this.assertCleanForPull();
     if (!fetchHead) {
       if (this.lastFetchError) throw new Error(this.lastFetchError);
       return [];
     }
 
     return this.mergeRemote(fetchHead, (m) => console.log(`[git-sync] ${m}`));
+  }
+
+  private async assertCleanForPull(): Promise<void> {
+    const dirtyPaths = (await this.trackedStatus())
+      .filter(([, head, workdir, stage]) => workdir !== head || stage !== head)
+      .map(([filepath]) => filepath);
+    if (dirtyPaths.length > 0) {
+      throw new Error(`Local working changes prevent pull: ${dirtyPaths.join(", ")}`);
+    }
   }
 
   private async readBlobBytesAt(

@@ -9,12 +9,18 @@ import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename 
 import { normalizeGitPath } from "./sync/paths";
 import { persistResolutionMetadata } from "./sync/resolution-completion";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
+import { REMOTE_POLL_INTERVAL_MS } from "./constants";
+import { RemotePoller } from "./sync/remote-poller";
 
 export default class MultiSyncPlugin extends Plugin {
   settings!: PluginSettings;
   private statusBar!: StatusBarItem;
   private gitSync: GitSync | null = null;
   private syncQueue: SyncQueue | null = null;
+  private remotePoller: RemotePoller | null = null;
+  private unloading = false;
+  private foregroundOperations = 0;
+  private conflictActive = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -43,10 +49,12 @@ export default class MultiSyncPlugin extends Plugin {
     // Pull on open — wait for workspace to be ready
     this.app.workspace.onLayoutReady(async () => {
       if (this.gitSync) {
+        this.foregroundOperations++;
         this.setStatus("pulling");
         try {
           const conflicts = await this.gitSync.pull();
           if (conflicts.length > 0) {
+            this.conflictActive = true;
             this.syncQueue?.pauseForConflict();
             this.setStatus("conflict");
             this.showConflictModal(conflicts);
@@ -56,6 +64,8 @@ export default class MultiSyncPlugin extends Plugin {
         } catch {
           // Pull errors on open are non-fatal (e.g. offline) — just show error state
           this.setStatus("error", "Pull failed on open");
+        } finally {
+          this.foregroundOperations--;
         }
       }
     });
@@ -121,6 +131,10 @@ export default class MultiSyncPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    // Stop future callbacks before queue shutdown. A pull already holding the
+    // GitSync mutex is allowed to finish, matching the queue's shutdown model.
+    this.unloading = true;
+    this.stopRemotePolling();
     // Flush pending changes on close
     if (this.syncQueue) {
       await this.syncQueue.shutdown();
@@ -144,6 +158,8 @@ export default class MultiSyncPlugin extends Plugin {
    * Determines whether to clone (existing repo) or init+push (new repo).
    */
   async initializeRepo(token: string, username: string): Promise<void> {
+    this.foregroundOperations++;
+    this.stopRemotePolling();
     this.setStatus("connecting");
 
     const vaultName = this.app.vault.getName();
@@ -162,8 +178,9 @@ export default class MultiSyncPlugin extends Plugin {
       this.isExcluded(p)
     );
 
-    const exists      = await repoExists(token, username, repoName);
-    const alreadyInit = await sync.isInitialized();
+    try {
+      const exists      = await repoExists(token, username, repoName);
+      const alreadyInit = await sync.isInitialized();
 
     const allFiles = () =>
       this.app.vault
@@ -199,12 +216,17 @@ export default class MultiSyncPlugin extends Plugin {
     await this.saveSettings();
     await this.bootSyncEngine();
     this.setStatus("idle");
+    } finally {
+      this.foregroundOperations--;
+      this.updateRemotePolling();
+    }
   }
 
   async bootSyncEngine(): Promise<void> {
     const { githubToken, githubUsername, repoName } = this.settings;
     if (!githubToken || !githubUsername || !repoName) return;
 
+    this.stopRemotePolling();
     const adapter = this.app.vault.adapter;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const vaultPath: string = (adapter as any).basePath ?? "";
@@ -225,6 +247,59 @@ export default class MultiSyncPlugin extends Plugin {
         this.saveSettings();
       }
     }, this.settings.syncIntervalMs);
+    this.updateRemotePolling();
+  }
+
+  updateAutoSync(enabled: boolean): void {
+    this.settings.autoSync = enabled;
+    this.updateRemotePolling();
+  }
+
+  disconnectSyncEngine(): void {
+    this.stopRemotePolling();
+    this.gitSync = null;
+    this.syncQueue = null;
+  }
+
+  private updateRemotePolling(): void {
+    if (!this.settings.autoSync || !this.gitSync || this.unloading) {
+      this.stopRemotePolling();
+      return;
+    }
+    if (!this.remotePoller) {
+      this.remotePoller = new RemotePoller(
+        REMOTE_POLL_INTERVAL_MS,
+        (callback, intervalMs) => {
+          const timer = window.setInterval(callback, intervalMs);
+          this.registerInterval(timer);
+          return timer;
+        },
+        (timer) => window.clearInterval(timer),
+        () => !this.unloading && this.settings.autoSync && !!this.gitSync &&
+          this.foregroundOperations === 0 && !this.conflictActive &&
+          !!this.syncQueue?.isIdleForRemotePull(),
+        () => this.pollRemote(),
+        (error) => console.debug("[git-sync] Passive remote poll failed; will retry", error)
+      );
+    }
+    this.remotePoller.start();
+  }
+
+  private stopRemotePolling(): void {
+    this.remotePoller?.stop();
+  }
+
+  private async pollRemote(): Promise<void> {
+    const sync = this.gitSync;
+    if (!sync) return;
+    const conflicts = await sync.pull();
+    if (this.unloading || sync !== this.gitSync) return;
+    if (conflicts.length > 0) {
+      this.conflictActive = true;
+      this.syncQueue?.pauseForConflict();
+      this.setStatus("conflict");
+      this.showConflictModal(conflicts);
+    }
   }
 
   updateSyncIntervalMs(debounceMs: number): void {
@@ -239,8 +314,10 @@ export default class MultiSyncPlugin extends Plugin {
       return;
     }
 
+    this.conflictActive = false;
     this.syncQueue?.supersedeConflictForManualSync();
 
+    this.foregroundOperations++;
     this.setStatus("pulling");
     try {
       const allFiles = this.app.vault
@@ -259,6 +336,7 @@ export default class MultiSyncPlugin extends Plugin {
       }
 
       if (result.conflictFiles.length > 0) {
+        this.conflictActive = true;
         this.syncQueue?.pauseForConflict();
         this.setStatus("conflict");
         this.showConflictModal(result.conflictFiles);
@@ -275,6 +353,8 @@ export default class MultiSyncPlugin extends Plugin {
       const msg = err instanceof Error ? err.message : String(err);
       this.setStatus("error", msg);
       new Notice(`Sync failed: ${msg}`);
+    } finally {
+      this.foregroundOperations--;
     }
   }
 
@@ -286,6 +366,7 @@ export default class MultiSyncPlugin extends Plugin {
         // Returns true only once EVERY conflict is decided and the merge landed.
         const result = await this.gitSync!.resolveConflict(filepath, resolved, conflictSessionId);
         if (result.stale) {
+          this.conflictActive = false;
           this.setStatus("error", result.message);
           new Notice(result.message ?? "Conflict is stale. Please sync again.");
           this.syncQueue?.resumeAfterConflict();
@@ -301,6 +382,7 @@ export default class MultiSyncPlugin extends Plugin {
           return "replaced";
         }
         if (result.completed) {
+          this.conflictActive = false;
           this.settings.lastSyncTime = Date.now();
           this.setStatus("idle");
           new Notice("Conflicts resolved — vault synced.");
@@ -318,6 +400,7 @@ export default class MultiSyncPlugin extends Plugin {
         // repo stays exactly as it was. The next sync will offer it again.
         void (async () => {
           await this.gitSync?.abandonMerge(conflicts[0].conflictSessionId);
+          this.conflictActive = false;
           this.syncQueue?.resumeAfterConflict();
           this.setStatus("idle");
         })();

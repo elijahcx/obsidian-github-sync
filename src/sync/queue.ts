@@ -47,6 +47,12 @@ export class SyncQueue {
     return this.debounceMs;
   }
 
+  /** Passive pulls must yield to queued, debounced, active, or conflicted work. */
+  isIdleForRemotePull(): boolean {
+    return !this.shuttingDown && !this.conflictPaused && this.pendingFiles.size === 0 &&
+      this.debounceTimer === null && this.activeFlush === null;
+  }
+
   private scheduleFlush(): void {
     if (this.shuttingDown || this.conflictPaused) return;
     this.debounceTimer = setTimeout(() => {
