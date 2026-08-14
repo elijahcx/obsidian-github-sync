@@ -67,8 +67,8 @@ Laptop   ──┘
 ### 1.1 — Clone the Repository
 
 ```bash
-git clone https://github.com/elijahcx/obsidian-gitsyncvault.git
-cd obsidian-gitsyncvault
+git clone https://github.com/elijahcx/obsidian-github-sync.git
+cd obsidian-github-sync
 ```
 
 ### 1.2 — Install Dependencies
@@ -103,7 +103,7 @@ build needs no `.env` or CI secret.
 ### 1.4 — Project Structure
 
 ```
-obsidian-gitsyncvault/
+obsidian-github-sync/
 ├── src/
 │   ├── main.ts                   # Plugin entry point — wires everything together
 │   ├── types.ts                  # All TypeScript interfaces & types
@@ -160,17 +160,17 @@ After running `npm run build`:
 
 ```bash
 # Windows (run as Administrator)
-mklink /D "C:\path\to\vault\.obsidian\plugins\gitsyncvault" "C:\path\to\obsidian-gitsyncvault"
+mklink /D "C:\path\to\vault\.obsidian\plugins\gitsyncvault" "C:\path\to\obsidian-github-sync"
 
 # macOS / Linux
-ln -s /path/to/obsidian-gitsyncvault /path/to/vault/.obsidian/plugins/gitsyncvault
+ln -s /path/to/obsidian-github-sync /path/to/vault/.obsidian/plugins/gitsyncvault
 ```
 
 ### Option B — BRAT (Beta Testers)
 
 1. Install the [BRAT plugin](https://github.com/TfTHacker/obsidian42-brat) from Community Plugins.
 2. Open BRAT settings → **Add Beta Plugin**
-3. Paste the repo URL: `https://github.com/elijahcx/obsidian-gitsyncvault`
+3. Paste the repo URL: `https://github.com/elijahcx/obsidian-github-sync`
 4. Click **Add Plugin** — BRAT installs it automatically.
 
 ---
@@ -514,8 +514,8 @@ Pull requests welcome!
 
 ```bash
 # 1. Fork and clone
-git clone https://github.com/elijahcx/obsidian-gitsyncvault.git
-cd obsidian-gitsyncvault
+git clone https://github.com/elijahcx/obsidian-github-sync.git
+cd obsidian-github-sync
 
 # 2. Install deps
 npm install
@@ -529,7 +529,7 @@ npm run dev
 npx tsc --noEmit
 ```
 
-For bugs and feature requests, open an [issue](https://github.com/elijahcx/obsidian-gitsyncvault/issues).
+For bugs and feature requests, open an [issue](https://github.com/elijahcx/obsidian-github-sync/issues).
 
 ---
 
