@@ -16,6 +16,7 @@
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",
     "typecheck": "tsc --noEmit",
+    "prebuild:test": "node -e \"require('node:fs').rmSync('.test-dist', { recursive: true, force: true })\"",
     "build:test": "tsc -p tsconfig.test.json && node tests/setup-test-dist.cjs",
     "test": "npm run build:test && node --test \".test-dist/tests/**/*.test.js\"",
     "test:watch": "npm run build:test && node --test --watch \".test-dist/tests/**/*.test.js\""
