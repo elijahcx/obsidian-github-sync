@@ -24,6 +24,8 @@ export default class MultiSyncPlugin extends Plugin {
   private unloading = false;
   private foregroundOperations = 0;
   private conflictActive = false;
+  private activeConflicts: ConflictFile[] | null = null;
+  private conflictModalOpen = false;
   private currentStatus: SyncStatus = "idle";
   private lastSuccessfulSyncAt: number | null = null;
 
@@ -32,7 +34,7 @@ export default class MultiSyncPlugin extends Plugin {
     this.lastSuccessfulSyncAt = this.settings.lastSyncTime || null;
 
     this.statusBar = new StatusBarItem(this);
-    this.statusBar.onClick(() => this.triggerManualSync());
+    this.statusBar.onClick(() => this.handleStatusBarClick());
 
     this.addSettingTab(new MultiSyncSettingsTab(this.app, this));
 
@@ -65,10 +67,7 @@ export default class MultiSyncPlugin extends Plugin {
         try {
           const conflicts = await this.gitSync.pull();
           if (conflicts.length > 0) {
-            this.conflictActive = true;
-            this.syncQueue?.pauseForConflict();
-            this.setStatus("conflict");
-            this.showConflictModal(conflicts);
+            this.presentConflicts(conflicts);
           } else {
             this.markSuccessfulSync(false);
             this.setStatus("idle");
@@ -260,7 +259,8 @@ export default class MultiSyncPlugin extends Plugin {
         this.markSuccessfulSync();
         this.saveSettings();
       }
-    }, this.settings.syncIntervalMs, () => this.refreshDiagnostics());
+    }, this.settings.syncIntervalMs, () => this.refreshDiagnostics(),
+    (conflicts) => this.presentConflicts(conflicts));
     this.updateRemotePolling();
   }
 
@@ -313,10 +313,7 @@ export default class MultiSyncPlugin extends Plugin {
     const conflicts = await sync.pull();
     if (this.unloading || sync !== this.gitSync) return "success";
     if (conflicts.length > 0) {
-      this.conflictActive = true;
-      this.syncQueue?.pauseForConflict();
-      this.setStatus("conflict");
-      this.showConflictModal(conflicts);
+      this.presentConflicts(conflicts);
       return "skipped-conflict";
     } else {
       this.markSuccessfulSync(false);
@@ -336,8 +333,12 @@ export default class MultiSyncPlugin extends Plugin {
       return;
     }
 
-    this.conflictActive = false;
-    this.syncQueue?.supersedeConflictForManualSync();
+    // An unresolved session owns synchronization. Manual sync must not discard
+    // it or put another conflict modal underneath the active one.
+    if (this.activeConflicts) {
+      this.presentConflicts(this.activeConflicts);
+      return;
+    }
 
     this.foregroundOperations++;
     this.setStatus("pulling");
@@ -354,10 +355,7 @@ export default class MultiSyncPlugin extends Plugin {
       // particular, do not leave a generic debug/error modal behind it for the
       // same conflict-bearing result.
       if (outcome.kind === "conflict") {
-        this.conflictActive = true;
-        this.syncQueue?.pauseForConflict();
-        this.setStatus("conflict");
-        this.showConflictModal(outcome.conflicts);
+        this.presentConflicts(outcome.conflicts);
       } else if (outcome.kind === "success") {
         if (result.logs?.length) showLogModal(this.app, "Sync OK", result.logs);
         this.syncQueue?.resumeAfterConflict();
@@ -378,15 +376,32 @@ export default class MultiSyncPlugin extends Plugin {
     }
   }
 
-  private showConflictModal(conflicts: ConflictFile[]): void {
+  private handleStatusBarClick(): void {
+    if (this.activeConflicts) this.presentConflicts(this.activeConflicts);
+    else void this.triggerManualSync();
+  }
+
+  /** The single owner for conflict state and presentation from every sync source. */
+  private presentConflicts(conflicts: ConflictFile[]): void {
+    if (conflicts.length === 0) return;
+    const sessionId = conflicts[0].conflictSessionId;
+    const activeSessionId = this.activeConflicts?.[0]?.conflictSessionId;
+    if (activeSessionId !== sessionId) this.activeConflicts = conflicts;
+    this.conflictActive = true;
+    this.syncQueue?.pauseForConflict();
+    this.setStatus("conflict");
+    if (this.conflictModalOpen) return;
+    this.conflictModalOpen = true;
+
     new ConflictModal(
       this.app,
-      conflicts,
+      this.activeConflicts!,
       async (filepath, resolved, conflictSessionId) => {
         // Returns true only once EVERY conflict is decided and the merge landed.
         const result = await this.gitSync!.resolveConflict(filepath, resolved, conflictSessionId);
         if (result.stale) {
           this.conflictActive = false;
+          this.activeConflicts = null;
           this.setStatus("error", result.message);
           new Notice(result.message ?? "Conflict is stale. Please sync again.");
           this.syncQueue?.resumeAfterConflict();
@@ -397,12 +412,16 @@ export default class MultiSyncPlugin extends Plugin {
           return "rejected";
         }
         if (result.conflictFiles?.length) {
-          this.setStatus("conflict");
-          this.showConflictModal(result.conflictFiles);
+          this.activeConflicts = result.conflictFiles;
+          this.conflictModalOpen = false;
+          // Let this modal close before presenting the replacement session.
+          window.setTimeout(() => this.presentConflicts(result.conflictFiles!), 0);
           return "replaced";
         }
         if (result.completed) {
           this.conflictActive = false;
+          this.activeConflicts = null;
+          this.conflictModalOpen = false;
           this.markSuccessfulSync();
           this.setStatus("idle");
           new Notice("Conflicts resolved — vault synced.");
@@ -416,14 +435,10 @@ export default class MultiSyncPlugin extends Plugin {
         return "accepted";
       },
       () => {
-        // Dismissed without deciding everything: drop the pending merge so the
-        // repo stays exactly as it was. The next sync will offer it again.
-        void (async () => {
-          await this.gitSync?.abandonMerge(conflicts[0].conflictSessionId);
-          this.conflictActive = false;
-          this.syncQueue?.resumeAfterConflict();
-          this.setStatus("idle");
-        })();
+        // X/Esc intentionally leaves the pending session and queue pause intact.
+        // Clicking the conflict status item (or Sync now) reopens this session.
+        this.conflictModalOpen = false;
+        if (this.activeConflicts) this.setStatus("conflict");
       }
     ).open();
   }

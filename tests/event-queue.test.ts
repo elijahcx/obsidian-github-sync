@@ -294,6 +294,33 @@ test("queue pauses after conflict, collects events, and resumes exactly once", a
   assert.equal(queue.isIdleForRemotePull(), true);
 });
 
+test("SyncQueue delivers an actionable conflict payload exactly once and stays paused", async () => {
+  const conflictFiles = [{
+    path: "shared.md", conflictSessionId: "queue-session", ours: "local", theirs: "remote",
+    oursExists: true, theirsExists: true, isBinary: false,
+  }];
+  let syncCalls = 0;
+  const presented: typeof conflictFiles[] = [];
+  const sync = { sync: async () => {
+    syncCalls++;
+    return { success: false, conflictFiles };
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 5, undefined, (conflicts) => presented.push(conflicts));
+
+  queue.enqueue("shared.md");
+  await queue.flushNow();
+  queue.enqueue("arrived-while-conflicted.md");
+  await queue.flushNow();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(syncCalls, 1);
+  assert.equal(presented.length, 1);
+  assert.equal(presented[0], conflictFiles);
+  assert.equal(queue.getDiagnostics().conflictPaused, true);
+  assert.deepEqual(queue.getPendingFiles(), ["arrived-while-conflicted.md"]);
+  assert.equal(queue.isIdleForRemotePull(), false);
+});
+
 test("shutdown fences enqueue, callbacks, repeated shutdown, and post-timeout drain", async () => {
   let release!: () => void;
   let calls = 0;

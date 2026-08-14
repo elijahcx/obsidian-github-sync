@@ -1,10 +1,11 @@
 import { SYNC_DEBOUNCE_MS } from "../constants";
 import { GitSync } from "./git-sync";
-import { QueueDiagnostics, SyncResult, SyncStatus } from "../types";
+import { ConflictFile, QueueDiagnostics, SyncResult, SyncStatus } from "../types";
 import { normalizeGitPath } from "./paths";
 import { classifySyncResult } from "./result-classification";
 
 type StatusCallback = (status: SyncStatus, detail?: string) => void;
+type ConflictCallback = (conflicts: ConflictFile[]) => void;
 
 export class SyncQueue {
   private pendingFiles = new Set<string>();
@@ -22,7 +23,8 @@ export class SyncQueue {
     gitSync: GitSync,
     onStatus: StatusCallback,
     debounceMs: number = SYNC_DEBOUNCE_MS,
-    onDiagnosticsChange?: () => void
+    onDiagnosticsChange?: () => void,
+    private readonly onConflict?: ConflictCallback
   ) {
     this.gitSync = gitSync;
     this.onStatus = onStatus;
@@ -145,6 +147,7 @@ export class SyncQueue {
         this.conflictPaused = true;
         this.changed();
         this.emitStatus("conflict");
+        if (!this.shuttingDown) this.onConflict?.(outcome.conflicts);
       } else if (outcome.kind === "success") {
         this.emitStatus("idle");
       } else {
