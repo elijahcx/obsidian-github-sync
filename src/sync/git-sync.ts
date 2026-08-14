@@ -517,12 +517,13 @@ export class GitSync {
     });
 
     try {
-      await git.push({
-        ...this.netOpts(),
+      const localHead = await git.resolveRef({
+        fs: this.fs,
+        dir: this.dir,
         ref: DEFAULT_BRANCH,
-        remoteRef: DEFAULT_BRANCH,
-        force: false,
       });
+      const pushResult = await this.pushMain();
+      await this.verifyPushResult(pushResult, localHead);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`Initialization created local '${DEFAULT_BRANCH}' but could not push it: ${message}`);
@@ -656,15 +657,13 @@ export class GitSync {
 
       try {
         log(`step3 pushing attempt=${attempt} local=${short(localHead)} remote=${short(remoteHead)}`);
-        const pushRes = await git.push({
-          ...this.netOpts(),
-          ref: DEFAULT_BRANCH,
-          remoteRef: DEFAULT_BRANCH,
-          force: false,
-        });
-        log(`step3 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
+        const pushRes = await this.pushMain();
+        await this.verifyPushResult(pushRes, localHead);
+        log(`step3 push success attempt=${attempt} local=${short(localHead)}`);
+        if (remoteHead === null) log(`step3 remote ${DEFAULT_BRANCH} created`);
         return [];
       } catch (e) {
+        log(`step3 push rejected attempt=${attempt}: ${e instanceof Error ? e.message : String(e)}`);
         if (!this.isNonFastForwardPushError(e) || attempt >= MAX_PUSH_ATTEMPTS) {
           throw e;
         }
@@ -688,13 +687,53 @@ export class GitSync {
     return [];
   }
 
+  /** Perform the one supported push shape. This is deliberately never forced. */
+  private pushMain(): Promise<git.PushResult> {
+    return git.push({
+      ...this.netOpts(),
+      ref: DEFAULT_BRANCH,
+      remoteRef: DEFAULT_BRANCH,
+      force: false,
+    });
+  }
+
+  /**
+   * A resolved push promise is not, by itself, proof that the requested ref was
+   * accepted. Require both the receive-pack status and isomorphic-git's updated
+   * remote-tracking ref to confirm that origin/main now names our local HEAD.
+   */
+  private async verifyPushResult(result: git.PushResult, localHead: string): Promise<void> {
+    const remoteRef = `refs/heads/${DEFAULT_BRANCH}`;
+    const status = result?.refs?.[remoteRef];
+    if (!result?.ok || !status?.ok) {
+      const reason = status?.error || result?.error || `no successful update for ${remoteRef}`;
+      throw new Error(`Push did not update ${remoteRef}: ${reason}`);
+    }
+
+    let trackedHead: string;
+    try {
+      trackedHead = await git.resolveRef({
+        fs: this.fs,
+        dir: this.dir,
+        ref: `refs/remotes/origin/${DEFAULT_BRANCH}`,
+      });
+    } catch {
+      throw new Error(`Push reported success but refs/remotes/origin/${DEFAULT_BRANCH} was not created`);
+    }
+    if (trackedHead !== localHead) {
+      throw new Error(
+        `Push reported success but origin/${DEFAULT_BRANCH} is ${trackedHead}, expected ${localHead}`
+      );
+    }
+  }
+
   /** True only for push rejections that should be solved by fetch/merge/retry. */
   private isNonFastForwardPushError(error: unknown): boolean {
     const code = (error as { code?: string })?.code ?? "";
     const msg = error instanceof Error ? error.message : String(error);
     return (
       code === "PushRejectedError" ||
-      /not a simple fast-forward|non-fast-forward|fetch first|rejected/i.test(msg)
+      /not a simple fast-forward|non-fast-forward|fetch first/i.test(msg)
     );
   }
 

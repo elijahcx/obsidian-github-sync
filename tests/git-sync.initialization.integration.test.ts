@@ -84,10 +84,76 @@ test("sync treats a reachable empty remote as empty and performs the first non-f
       await git(["--git-dir", remote.remotePath, "show", "main:note.md"]),
       "local initial history"
     );
+    assert.ok(first.logs?.some((line) => line.includes("push success")));
+    assert.ok(first.logs?.some((line) => line.includes("remote main created")));
 
     const second = await device.sync.sync([]);
     assert.equal(second.success, true, second.error);
     assert.equal(await git(["rev-parse", "refs/remotes/origin/main"], device.dir), localMain);
+  });
+});
+
+type PushInternals = {
+  safeFetch: () => Promise<string | null>;
+  pushMain: () => Promise<{
+    ok: boolean;
+    error: string | null;
+    refs: Record<string, { ok: boolean; error: string }>;
+  }>;
+};
+
+test("a rejected first push cannot be reported as successful", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "rejected-first-push");
+    await createLocalMain(device, remote.url);
+    const internals = device.sync as unknown as PushInternals;
+    internals.safeFetch = async () => null;
+    internals.pushMain = async () => ({
+      ok: false,
+      error: "receive-pack rejected the update",
+      refs: { "refs/heads/main": { ok: false, error: "rejected" } },
+    });
+
+    const result = await device.sync.sync([]);
+    assert.equal(result.success, false);
+    assert.match(result.error ?? "", /did not update.*rejected/i);
+    assert.ok(result.logs?.some((line) => line.includes("push rejected")));
+    assert.equal(result.logs?.filter((line) => line.includes("pushing attempt=")).length, 1);
+    await assert.rejects(git(["--git-dir", remote.remotePath, "rev-parse", "refs/heads/main"]));
+  });
+});
+
+test("a push result without a successful main update cannot be reported as successful", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "missing-push-update");
+    await createLocalMain(device, remote.url);
+    const internals = device.sync as unknown as PushInternals;
+    internals.safeFetch = async () => null;
+    internals.pushMain = async () => ({ ok: true, error: null, refs: {} });
+
+    const result = await device.sync.sync([]);
+    assert.equal(result.success, false);
+    assert.match(result.error ?? "", /no successful update/i);
+    await assert.rejects(git(["--git-dir", remote.remotePath, "rev-parse", "refs/heads/main"]));
+  });
+});
+
+test("a push authentication failure cannot be reported as successful", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "push-auth-failure");
+    await createLocalMain(device, remote.url);
+    const internals = device.sync as unknown as PushInternals;
+    internals.safeFetch = async () => null;
+    internals.pushMain = async () => {
+      const error = new Error("authentication required") as Error & { code: string };
+      error.code = "HttpError";
+      throw error;
+    };
+
+    const result = await device.sync.sync([]);
+    assert.equal(result.success, false);
+    assert.match(result.error ?? "", /authentication required/i);
+    await assert.rejects(git(["--git-dir", remote.remotePath, "rev-parse", "refs/heads/main"]));
   });
 });
 
