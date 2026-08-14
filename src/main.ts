@@ -234,7 +234,7 @@ export default class MultiSyncPlugin extends Plugin {
   async triggerManualSync(): Promise<void> {
     if (!this.gitSync) {
       new Notice(
-        "MultiSync: not connected. Please connect your GitHub account in settings."
+        "Git Sync Vault: not connected. Please connect your GitHub account in settings."
       );
       return;
     }

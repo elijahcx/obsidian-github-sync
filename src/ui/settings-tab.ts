@@ -14,7 +14,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "MultiSync Settings" });
+    containerEl.createEl("h2", { text: "Git Sync Vault Settings" });
 
     const settings = this.plugin.settings;
 
@@ -79,7 +79,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName("Connect GitHub account")
         .setDesc(
-          "Authorise MultiSync to access your private repos. Opens a browser window."
+          "Authorise Git Sync Vault to access your private repos. Opens a browser window."
         )
         .addButton((btn) => {
           btn

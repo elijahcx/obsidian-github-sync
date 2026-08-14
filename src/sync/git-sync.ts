@@ -202,7 +202,7 @@ export class GitSync {
       url: this.remoteUrl,
       onAuth: () => ({ username, password: token }),
       onAuthFailure: () => {
-        throw new Error("GitHub authentication failed. Please reconnect your account in MultiSync settings.");
+        throw new Error("GitHub authentication failed. Please reconnect your account in Git Sync Vault settings.");
       },
     };
   }

@@ -10,7 +10,7 @@ const prod = process.argv[2] === "production";
 const externalBuiltins = builtinModules.filter((m) => m !== "buffer");
 
 esbuild.build({
-  banner: { js: "/* obsidian-multisync */" },
+  banner: { js: "/* Git Sync Vault */" },
   entryPoints: ["src/main.ts"],
   bundle: true,
   external: [

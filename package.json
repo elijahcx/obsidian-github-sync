@@ -1,7 +1,16 @@
 {
-  "name": "obsidian-multisync",
+  "name": "obsidian-gitsyncvault",
+  "private": true,
   "version": "1.0.0",
-  "description": "Sync Obsidian vaults across devices via GitHub",
+  "description": "Safe cross-platform GitHub synchronization for Obsidian vaults",
+  "author": "Livan Kumar (original Git Sync project)",
+  "maintainers": [
+    "Elijah (https://github.com/elijahcx)"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elijahcx/obsidian-gitsyncvault.git"
+  },
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",

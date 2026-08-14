@@ -1,11 +1,11 @@
 {
-  "id": "git-obsi-sync",
-  "name": "Git Sync",
+  "id": "gitsyncvault",
+  "name": "Git Sync Vault",
   "version": "1.0.15",
   "minAppVersion": "1.0.1",
-  "description": "Sync your vault across all devices using your own GitHub account. Free forever.",
-  "author": "Livan Kumar",
-  "authorUrl": "https://github.com/livan116",
+  "description": "Safe cross-platform GitHub synchronization for Obsidian vaults.",
+  "author": "Elijah",
+  "authorUrl": "https://github.com/elijahcx",
   "fundingUrl": "",
   "isDesktopOnly": false
 }
