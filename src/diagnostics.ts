@@ -41,6 +41,10 @@ export function relativeTime(value: number | null, now = Date.now()): string {
 
 function yesNo(value: boolean): string { return value ? "yes" : "no"; }
 
+function formatRemoteOutcome(outcome: RemotePollDiagnostics["lastOutcome"]): string {
+  return outcome === "success" ? "check-completed" : outcome ?? "Never";
+}
+
 export function buildDiagnosticReport(d: SyncDiagnostics): string {
   return [
     "Git Sync Vault Diagnostics",
@@ -58,7 +62,7 @@ export function buildDiagnosticReport(d: SyncDiagnostics): string {
     `Last successful sync: ${formatTimestamp(d.lastSuccessfulSyncAt)}`,
     `Last remote attempt: ${formatTimestamp(d.polling.lastAttemptAt)}`,
     `Last remote success: ${formatTimestamp(d.polling.lastSuccessAt)}`,
-    `Last remote outcome: ${d.polling.lastOutcome ?? "Never"}`,
+    `Last remote outcome: ${formatRemoteOutcome(d.polling.lastOutcome)}`,
     `Pending files: ${d.queue.pendingCount}`,
     `Queue active: ${yesNo(d.queue.active)}`,
     `Debounce pending: ${yesNo(d.queue.debouncePending)}`,

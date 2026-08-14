@@ -19,6 +19,8 @@ test("safe report contains configured state but no credentials or vault path", (
   assert.match(report, /Git Sync Vault Diagnostics/);
   assert.match(report, /Version: 1\.0\.15/);
   assert.match(report, /GitHub username: octocat/);
+  assert.match(report, /Last remote outcome: check-completed/);
+  assert.doesNotMatch(report, /Last remote outcome: success/);
   assert.match(report, /Pending files: 0/);
   assert.doesNotMatch(report, /token|Authorization|Client Secret|\/Users\/secret/i);
 });
