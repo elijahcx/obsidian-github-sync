@@ -33,8 +33,8 @@ merge, conflict UI, non-forced push, and recovery behavior used by vault notes.
 Consequently, simultaneous edits are not resolved last-writer-wins: a textual
 merge is accepted only when Git can merge it, and overlapping edits are shown
 as a conflict without silently choosing either device. Obsidian rewrites during
-a sync remain ordinary concurrent working-tree changes and fail visibly under
-the existing dirty-file safeguards; this feature adds no special retry loop.
+a fetch remain protected by the existing dirty-file guard and its bounded,
+pre-merge restart; continuously changing files still fail visibly.
 
 ## Enabling a category on another device
 

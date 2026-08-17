@@ -29,6 +29,66 @@ test("selected app.json changes sync while other config and credentials do not",
   });
 });
 
+test("selected app.json changed during fetch restarts with its newest bytes", async () => {
+  await withRemote({ ".obsidian/app.json": "{\"value\":\"base\"}\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "config-fetch-restart", selective);
+    await device.sync.clone();
+    await device.write(".obsidian/app.json", "{\"value\":\"before-fetch\"}\n");
+
+    const internals = device.sync as unknown as {
+      safeFetch: () => Promise<string | null>;
+      waitForLocalChangeStability: () => Promise<void>;
+    };
+    const realFetch = internals.safeFetch.bind(device.sync);
+    let fetches = 0;
+    internals.waitForLocalChangeStability = async () => {};
+    internals.safeFetch = async () => {
+      const head = await realFetch();
+      if (++fetches === 1) {
+        await device.write(".obsidian/app.json", "{\"value\":\"newest\"}\n");
+      }
+      return head;
+    };
+
+    const result = await device.sync.sync([".obsidian/app.json"]);
+    assert.equal(result.success, true, result.error);
+    assert.equal(fetches, 2);
+    assert.match((result.logs ?? []).join("\n"), /local-change-retry=1/);
+    assert.equal(await device.read(".obsidian/app.json"), "{\"value\":\"newest\"}\n");
+    assert.equal(
+      await git(["--git-dir", remote.remotePath, "show", "main:.obsidian/app.json"]),
+      "{\"value\":\"newest\"}"
+    );
+  });
+});
+
+test("selected app.json that changes on every fetch stops after bounded restarts", async () => {
+  await withRemote({ ".obsidian/app.json": "{\"value\":0}\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "config-fetch-bounded", selective);
+    await device.sync.clone();
+    const internals = device.sync as unknown as {
+      safeFetch: () => Promise<string | null>;
+      waitForLocalChangeStability: () => Promise<void>;
+    };
+    const realFetch = internals.safeFetch.bind(device.sync);
+    let fetches = 0;
+    internals.waitForLocalChangeStability = async () => {};
+    internals.safeFetch = async () => {
+      const head = await realFetch();
+      fetches++;
+      await device.write(".obsidian/app.json", `{\"value\":\"${"x".repeat(fetches)}\"}\n`);
+      return head;
+    };
+
+    const result = await device.sync.sync([".obsidian/app.json"]);
+    assert.equal(result.success, false);
+    assert.equal(fetches, 3);
+    assert.match(result.error ?? "", /Local files changed during sync; retrying is required/);
+    assert.equal(await device.read(".obsidian/app.json"), "{\"value\":\"xxx\"}\n");
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:.obsidian/app.json"]), "{\"value\":0}");
+  });
+});
+
 test("simultaneous selected config changes surface a conflict without choosing a device", async () => {
   await withRemote({ ".obsidian/app.json": "{\"attachmentFolderPath\":\"base\"}\n" }, async ({ remote, root }) => {
     const a = await makeDevice(remote.url, root, "config-a", selective);
