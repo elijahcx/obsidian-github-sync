@@ -2,9 +2,48 @@ import { App, PluginSettingTab, Setting, Notice, ButtonComponent } from "obsidia
 import type MultiSyncPlugin from "../main";
 import { requestDeviceCode, pollForToken } from "../auth/github-device";
 import { getAuthenticatedUser } from "../github/api";
+import type { DeviceFlowResponse } from "../types";
+
+type DeviceFlowElement = HTMLElement & {
+  createDiv(options?: { cls?: string }): DeviceFlowElement;
+  createEl<K extends keyof HTMLElementTagNameMap>(
+    tag: K,
+    options?: { text?: string; cls?: string; href?: string }
+  ): HTMLElementTagNameMap[K] & DeviceFlowElement;
+};
+
+export function renderDeviceFlowPanel(
+  containerEl: DeviceFlowElement,
+  deviceFlow: DeviceFlowResponse,
+  copyCode: () => Promise<void>
+): HTMLElement {
+  containerEl.querySelector(".gitsyncvault-device-flow")?.remove();
+  const panel = containerEl.createDiv({ cls: "gitsyncvault-device-flow" });
+  panel.createEl("p", {
+    text: "Open this URL in your browser and enter the code below:",
+  });
+  const link = panel.createEl("a", {
+    text: deviceFlow.verification_uri,
+    href: deviceFlow.verification_uri,
+  });
+  link.addClass("gitsyncvault-device-flow-link");
+  panel.createDiv({ cls: "gitsyncvault-user-code" }).setText(deviceFlow.user_code);
+  const copyButton = panel.createEl("button", {
+    text: "Copy code",
+    cls: "gitsyncvault-copy-code",
+  });
+  copyButton.addEventListener("click", () => void copyCode());
+  panel.createEl("p", {
+    text: "Waiting for you to approve in the browser…",
+    cls: "setting-item-description",
+  });
+  return panel;
+}
 
 export class MultiSyncSettingsTab extends PluginSettingTab {
   plugin: MultiSyncPlugin;
+  private authAttemptGeneration = 0;
+  private activeAuthAttempt: number | null = null;
 
   constructor(app: App, plugin: MultiSyncPlugin) {
     super(app, plugin);
@@ -158,6 +197,15 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
   }
 
   private async startDeviceFlow(btn: ButtonComponent): Promise<void> {
+    if (this.activeAuthAttempt !== null) {
+      this.authAttemptGeneration++;
+      this.activeAuthAttempt = null;
+      this.removeDeviceFlowPanel();
+      btn.setButtonText("Connect GitHub").setDisabled(false);
+      new Notice("Connection cancelled.");
+      return;
+    }
+
     const clientId = this.plugin.settings.clientId;
     if (!clientId) {
       new Notice(
@@ -166,29 +214,21 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
       return;
     }
 
+    const attempt = ++this.authAttemptGeneration;
+    this.activeAuthAttempt = attempt;
+    this.removeDeviceFlowPanel();
     btn.setButtonText("Connecting…").setDisabled(true);
 
     try {
-      const deviceFlow = await requestDeviceCode(clientId);
+      const deviceFlow = await this.requestDeviceCode(clientId);
+      if (!this.isCurrentAuthAttempt(attempt)) return;
 
       // Show the user their one-time code
-      const modal = this.containerEl.createDiv({ cls: "gitsyncvault-device-flow" });
-      modal.createEl("p", {
-        text: "Open this URL in your browser and enter the code below:",
-      });
-      const link = modal.createEl("a", {
-        text: deviceFlow.verification_uri,
-        href: deviceFlow.verification_uri,
-      });
-      link.addClass("gitsyncvault-device-flow-link");
-      modal.createEl("h1", {
-        text: deviceFlow.user_code,
-        cls: "gitsyncvault-user-code",
-      });
-      modal.createEl("p", {
-        text: "Waiting for you to approve in the browser…",
-        cls: "setting-item-description",
-      });
+      const panel = renderDeviceFlowPanel(
+        this.containerEl as DeviceFlowElement,
+        deviceFlow,
+        () => this.copyDeviceCode(deviceFlow.user_code)
+      );
 
       // Restore button so the user can cancel / retry while waiting
       btn.setButtonText("Cancel").setDisabled(false);
@@ -197,32 +237,72 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
       window.open(deviceFlow.verification_uri, "_blank");
 
       // Poll until approved
-      const token = await pollForToken(
+      const token = await this.pollForToken(
         clientId,
         deviceFlow.device_code,
         deviceFlow.interval,
         deviceFlow.expires_in
       );
-
-      modal.remove();
+      if (!this.isCurrentAuthAttempt(attempt)) return;
 
       // Get user info
-      const user = await getAuthenticatedUser(token);
+      const user = await this.getAuthenticatedUser(token);
+      if (!this.isCurrentAuthAttempt(attempt)) return;
       this.plugin.settings.githubToken    = token;
       this.plugin.settings.githubUsername = user.login;
 
       // Initialise the repo
       await this.plugin.initializeRepo(token, user.login);
+      if (!this.isCurrentAuthAttempt(attempt)) return;
 
       await this.plugin.saveSettings();
+      if (!this.isCurrentAuthAttempt(attempt)) return;
+      panel.remove();
+      this.activeAuthAttempt = null;
       new Notice(`Connected as @${user.login}. Vault syncing started!`);
       this.display();
     } catch (err) {
+      if (!this.isCurrentAuthAttempt(attempt)) return;
       const msg = err instanceof Error ? err.message : String(err);
       // Remove the code panel if it's still visible
-      this.containerEl.querySelector(".multisync-device-modal")?.remove();
+      this.removeDeviceFlowPanel();
+      this.activeAuthAttempt = null;
       new Notice(`Connection failed: ${msg}`);
       btn.setButtonText("Connect GitHub").setDisabled(false);
     }
+  }
+
+  private isCurrentAuthAttempt(attempt: number): boolean {
+    return this.activeAuthAttempt === attempt;
+  }
+
+  private removeDeviceFlowPanel(): void {
+    this.containerEl.querySelector(".gitsyncvault-device-flow")?.remove();
+  }
+
+  private async copyDeviceCode(code: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(code);
+      new Notice("Device code copied.");
+    } catch {
+      new Notice("Could not copy the device code. Select it and copy it manually.");
+    }
+  }
+
+  protected requestDeviceCode(clientId: string): Promise<DeviceFlowResponse> {
+    return requestDeviceCode(clientId);
+  }
+
+  protected pollForToken(
+    clientId: string,
+    deviceCode: string,
+    intervalSeconds: number,
+    expiresIn: number
+  ): Promise<string> {
+    return pollForToken(clientId, deviceCode, intervalSeconds, expiresIn);
+  }
+
+  protected getAuthenticatedUser(token: string): Promise<{ login: string }> {
+    return getAuthenticatedUser(token);
   }
 }

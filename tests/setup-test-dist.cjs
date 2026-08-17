@@ -10,6 +10,15 @@ class FileSystemAdapter extends DataAdapter {
   getBasePath() { return this.basePath; }
 }
 class Modal {}
+class PluginSettingTab {
+  constructor(app, plugin) { this.app = app; this.plugin = plugin; this.containerEl = {}; }
+}
+class Setting {}
+class Notice {
+  constructor(message) { Notice.messages.push(message); }
+}
+Notice.messages = [];
+class ButtonComponent {}
 async function requestUrl(options) {
   const headers = options.headers || {};
   const init = { method: options.method || 'GET', headers, body: options.body };
@@ -20,5 +29,5 @@ async function requestUrl(options) {
   try { json = text ? JSON.parse(text) : undefined; } catch {}
   return { status: res.status, headers: Object.fromEntries(res.headers.entries()), arrayBuffer, text, json };
 }
-module.exports = { DataAdapter, FileSystemAdapter, Modal, requestUrl };
+module.exports = { DataAdapter, FileSystemAdapter, Modal, PluginSettingTab, Setting, Notice, ButtonComponent, requestUrl };
 `);
