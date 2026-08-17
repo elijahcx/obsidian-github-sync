@@ -41,6 +41,27 @@ test("initAndPush initializes an already-existing empty remote", async () => {
   });
 });
 
+test("initAndPush fails visibly instead of silently omitting an unreadable included file", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "unreadable-initial-file");
+    await device.write("readable.md", "safe\n");
+    await device.write("unreadable.md", "must not be omitted\n");
+    const originalRead = device.adapter.readBinary.bind(device.adapter);
+    device.adapter.readBinary = async (filepath) => {
+      if (filepath === "unreadable.md") {
+        throw Object.assign(new Error("provider read denied"), { code: "EACCES" });
+      }
+      return originalRead(filepath);
+    };
+
+    await assert.rejects(
+      device.sync.initAndPush(["readable.md", "unreadable.md"]),
+      /could not stage 'unreadable\.md'/i
+    );
+    await assert.rejects(git(["--git-dir", remote.remotePath, "rev-parse", "refs/heads/main"]));
+  });
+});
+
 test("initAndPush supports an empty vault and creates an empty initial commit on main", async () => {
   await withEmptyRemote(async ({ remote, root }) => {
     const device = await makeDevice(remote.url, root, "empty-vault");

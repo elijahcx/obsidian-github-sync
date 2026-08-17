@@ -646,14 +646,17 @@ export class GitSync {
       await git.init({ fs: this.fs, dir: this.dir, defaultBranch: DEFAULT_BRANCH });
     }
 
-    // Stage all vault files (skip any that fail)
+    // Every included file in the initial snapshot must be staged or setup must
+    // fail visibly. Silently skipping an unreadable file would let the UI report
+    // a successful first sync even though that file never reached the remote.
     for (const inputFile of vaultFiles) {
       const file = normalizeGitPath(inputFile);
       if (this.isExcluded(file)) continue;
       try {
         await git.add({ fs: this.fs, dir: this.dir, filepath: file });
-      } catch {
-        // Skip un-stageable files (binary, permission issues, etc.)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Initialization could not stage '${file}': ${message}`);
       }
     }
 
