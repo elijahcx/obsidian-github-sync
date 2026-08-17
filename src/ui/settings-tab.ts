@@ -174,6 +174,36 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
           })
       );
 
+    containerEl.createEl("h4", { text: "Selected Obsidian settings" });
+    containerEl.createEl("p", {
+      text: "Optional exceptions to the config-directory exclusion. Only the named Obsidian files are included; plugin data and workspace state stay excluded.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(containerEl)
+      .setName("Files & links")
+      .setDesc("Sync app.json, including attachment, link-format, auto-update, and wikilink preferences. Also includes other Files & Links preferences stored in that file.")
+      .addToggle((toggle) => toggle.setValue(settings.syncObsidianFilesAndLinks).onChange(async (val) => {
+        settings.syncObsidianFilesAndLinks = val;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName("Hotkeys")
+      .setDesc("Sync hotkeys.json. Opt in only after reviewing explicit Ctrl/Meta/Alt bindings on every operating system.")
+      .addToggle((toggle) => toggle.setValue(settings.syncObsidianHotkeys).onChange(async (val) => {
+        settings.syncObsidianHotkeys = val;
+        await this.plugin.saveSettings();
+      }));
+
+    new Setting(containerEl)
+      .setName("Appearance")
+      .setDesc("Sync appearance.json preferences only. Themes and CSS snippet files are not included and must exist on each device.")
+      .addToggle((toggle) => toggle.setValue(settings.syncObsidianAppearance).onChange(async (val) => {
+        settings.syncObsidianAppearance = val;
+        await this.plugin.saveSettings();
+      }));
+
     // ── Manual sync ───────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Manual Sync" });
 

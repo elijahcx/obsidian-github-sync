@@ -8,6 +8,9 @@ export interface PluginSettings {
   excludePatterns: string[];     // glob patterns to ignore (e.g. ".obsidian/workspace")
   lastSyncTime: number;          // unix timestamp of last successful sync
   commitMessageTemplate: string; // e.g. "sync: {{datetime}}"
+  syncObsidianFilesAndLinks: boolean;
+  syncObsidianHotkeys: boolean;
+  syncObsidianAppearance: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -25,6 +28,11 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   ],
   lastSyncTime: 0,
   commitMessageTemplate: "sync: {{datetime}}",
+  // Selective config is deliberately opt-in. These exceptions do not weaken
+  // the broad config-directory exclusion.
+  syncObsidianFilesAndLinks: false,
+  syncObsidianHotkeys: false,
+  syncObsidianAppearance: false,
 };
 
 export interface DeviceFlowResponse {
