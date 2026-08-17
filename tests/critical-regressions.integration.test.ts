@@ -75,25 +75,61 @@ test("clone preserves differing local collision and accepts identical content", 
   });
 });
 
-test("dirty unqueued file appearing during fetch is never overwritten", async () => {
-  await withRemote({ "a.md": "a0\n", "b.md": "b0\n" }, async ({ remote, root }) => {
+test("dirty unqueued file appearing during fetch is restarted and synchronized", async () => {
+  await withRemote({ "a.md": "a0\n", "b.md": "b0\n", "c.md": "c0\n" }, async ({ remote, root }) => {
     const source = await makeDevice(remote.url, root, "dirty-source");
     const device = await makeDevice(remote.url, root, "dirty-device");
     await source.sync.clone(); await device.sync.clone();
-    await source.write("b.md", "remote b\n");
-    assert.equal((await source.sync.sync(["b.md"])).success, true);
     await device.write("a.md", "local a\n");
     const internals = device.sync as never as { safeFetch: () => Promise<string | null> };
     const realFetch = internals.safeFetch.bind(device.sync);
+    let fetches = 0;
+    (internals as unknown as { waitForLocalChangeStability: () => Promise<void> }).waitForLocalChangeStability = async () => {};
     internals.safeFetch = async () => {
       const head = await realFetch();
-      await device.write("b.md", "late local b\n");
+      if (++fetches === 1) {
+        // Advance the remote after this attempt's fetch. The restart must fetch
+        // again rather than reconciling against the stale head.
+        await source.write("c.md", "remote c\n");
+        assert.equal((await source.sync.sync(["c.md"])).success, true);
+        await device.write("b.md", "late local b\n");
+      }
       return head;
     };
     const result = await device.sync.sync(["a.md"]);
-    assert.equal(result.success, false);
-    assert.match(result.error ?? "", /changed during sync/);
+    assert.equal(result.success, true, result.error);
+    assert.equal(fetches, 2);
     assert.equal(await device.read("b.md"), "late local b\n");
+    assert.equal(await git(["--git-dir", remote.remotePath, "show", "main:b.md"]), "late local b");
+    assert.equal(await device.read("c.md"), "remote c\n");
+  });
+});
+
+test("ordinary note changes stop after the local-change restart bound without pushing", async () => {
+  await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "note-fetch-bounded");
+    await device.sync.clone();
+    const remoteBefore = await git(["--git-dir", remote.remotePath, "rev-parse", "main"]);
+    const internals = device.sync as unknown as {
+      safeFetch: () => Promise<string | null>;
+      waitForLocalChangeStability: () => Promise<void>;
+    };
+    const realFetch = internals.safeFetch.bind(device.sync);
+    let fetches = 0;
+    internals.waitForLocalChangeStability = async () => {};
+    internals.safeFetch = async () => {
+      const head = await realFetch();
+      fetches++;
+      await device.write("note.md", `edit ${"x".repeat(fetches)}\n`);
+      return head;
+    };
+
+    const result = await device.sync.sync([]);
+    assert.equal(result.success, false);
+    assert.equal(fetches, 3);
+    assert.match(result.error ?? "", /Local files changed during sync; retrying is required/);
+    assert.equal(await device.read("note.md"), "edit xxx\n");
+    assert.equal(await git(["--git-dir", remote.remotePath, "rev-parse", "main"]), remoteBefore);
   });
 });
 

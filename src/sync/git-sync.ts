@@ -10,6 +10,8 @@ import { ConflictChoice, ConflictFile, ConflictResolutionResult, SyncChangeCount
 import { isBuiltInIgnoredPath, isSafeRelativePath, isSafeSnapshotBasename, normalizeGitPath, normalizeVaultPath } from "./paths";
 
 const MAX_PUSH_ATTEMPTS = 3;
+const MAX_LOCAL_CHANGE_RESTARTS = 2;
+const LOCAL_CHANGE_STABILITY_DELAY_MS = 350;
 let nextConflictSession = 1;
 const RECOVERY_SCHEMA_VERSION = 1;
 const RECOVERY_DIR = ".git/obsidian-sync-recovery";
@@ -814,87 +816,108 @@ export class GitSync {
     const logs: string[] = [];
     const log = (m: string) => { logs.push(m); };
     const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
-
-    log(`sync() start — ${changedFiles.length} candidate files`);
+    const candidates = new Set(changedFiles);
+    let localChangeRestarts = 0;
 
     try {
       const beforeHead = await this.currentHead();
-      // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
-      const filesToStage = await this.expandChangedPaths(changedFiles);
-      await this.preserveExcludedIndexEntries();
-      for (const file of filesToStage) {
-        await this.stagePath(file);
-      }
-
-      // Commit ONLY if the staged tree differs from HEAD. Otherwise we'd create a
-      // phantom commit that advances local HEAD past the remote for no reason.
-      const hasLocal = await this.hasLocalBranch();
-      let stagedChange = false;
-      try {
-        const matrix = await this.trackedStatus();
-        stagedChange = matrix.some(([, head, , stage]) => stage !== head);
-      } catch {
-        stagedChange = changedFiles.length > 0; // unborn branch / status unavailable
-      }
-      const mustCommit = stagedChange || !hasLocal;
-      log(`step1 stagedChange=${stagedChange} hasLocal=${hasLocal} commit=${mustCommit}`);
-
-      if (mustCommit) {
-        const now = new Date().toISOString().replace("T", " ").slice(0, 19);
-        if (!hasLocal) {
-          log(`step1 establishing initial ${DEFAULT_BRANCH}`);
-          const oid = await this.establishInitialMain(`sync: ${now}`);
-          log(`step1 ${DEFAULT_BRANCH}=${short(oid)}`);
-        } else {
-          const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
-          log(`step1 committed=${short(oid)}`);
+      while (true) {
+        log(`sync() start — ${candidates.size} candidate files`);
+        // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
+        const filesToStage = await this.expandChangedPaths([...candidates]);
+        await this.preserveExcludedIndexEntries();
+        for (const file of filesToStage) {
+          await this.stagePath(file);
         }
-      }
 
-      if (!(await this.hasLocalBranch())) {
-        throw new Error(`Sync initialization failed: could not establish local branch '${DEFAULT_BRANCH}'.`);
-      }
-
-      // ── 2. Fetch + merge remote ─────────────────────────────────────────────
-      this.lastFetchError = null;
-      const fetchHead = await this.safeFetch();
-      log(`step2 fetchHead=${short(fetchHead)}`);
-      if (fetchHead === null && this.lastFetchError) {
-        log(`step2 ${this.lastFetchError}`);
-        throw new Error(this.lastFetchError);
-      }
-
-      const dirtyAfterFetch = (await this.trackedStatus())
-        .filter(([, head, workdir]) => workdir !== head)
-        .map(([filepath]) => filepath);
-      if (dirtyAfterFetch.length > 0) {
-        throw new Error(`Local files changed during sync; retrying is required: ${dirtyAfterFetch.join(", ")}`);
-      }
-
-      let conflicts = await this.mergeRemote(fetchHead, log);
-
-      // ── 3. Push ─────────────────────────────────────────────────────────────
-      if (conflicts.length === 0) {
-        conflicts = await this.pushWithRetry(log, short);
-      }
-
-      log(`sync() OK conflicts=${conflicts.length}`);
-      let changes: SyncChangeCounts | undefined;
-      if (conflicts.length === 0) {
+        // Commit ONLY if the staged tree differs from HEAD. Otherwise we'd create a
+        // phantom commit that advances local HEAD past the remote for no reason.
+        const hasLocal = await this.hasLocalBranch();
+        let stagedChange = false;
         try {
-          changes = await this.countTreeChanges(beforeHead, await this.currentHead());
-        } catch (error) {
-          // The sync itself is already complete. A best-effort UI summary must
-          // never turn a successful push into a reported synchronization error.
-          log(`summary unavailable: ${error instanceof Error ? error.message : String(error)}`);
+          const matrix = await this.trackedStatus();
+          stagedChange = matrix.some(([, head, , stage]) => stage !== head);
+        } catch {
+          stagedChange = candidates.size > 0; // unborn branch / status unavailable
         }
+        const mustCommit = stagedChange || !hasLocal;
+        log(`step1 stagedChange=${stagedChange} hasLocal=${hasLocal} commit=${mustCommit}`);
+
+        if (mustCommit) {
+          const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+          if (!hasLocal) {
+            log(`step1 establishing initial ${DEFAULT_BRANCH}`);
+            const oid = await this.establishInitialMain(`sync: ${now}`);
+            log(`step1 ${DEFAULT_BRANCH}=${short(oid)}`);
+          } else {
+            const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
+            log(`step1 committed=${short(oid)}`);
+          }
+        }
+
+        if (!(await this.hasLocalBranch())) {
+          throw new Error(`Sync initialization failed: could not establish local branch '${DEFAULT_BRANCH}'.`);
+        }
+
+        // ── 2. Fetch + merge remote ─────────────────────────────────────────────
+        this.lastFetchError = null;
+        const fetchHead = await this.safeFetch();
+        log(`step2 fetchHead=${short(fetchHead)}`);
+        if (fetchHead === null && this.lastFetchError) {
+          log(`step2 ${this.lastFetchError}`);
+          throw new Error(this.lastFetchError);
+        }
+
+        const dirtyAfterFetch = (await this.trackedStatus())
+          .filter(([, head, workdir]) => workdir !== head)
+          .map(([filepath]) => filepath);
+        if (dirtyAfterFetch.length > 0) {
+          if (localChangeRestarts >= MAX_LOCAL_CHANGE_RESTARTS) {
+            throw new Error(`Local files changed during sync; retrying is required: ${dirtyAfterFetch.join(", ")}`);
+          }
+
+          // safeFetch only updates Git's remote-tracking data. mergeRemote (the
+          // first operation that can materialize incoming bytes), conflict setup,
+          // and push have not run yet, so the attempt can be abandoned without
+          // rolling back remote or working-tree state. Include every newly dirty
+          // participating path so the next attempt commits its newest bytes.
+          for (const path of dirtyAfterFetch) candidates.add(path);
+          localChangeRestarts++;
+          log(`step2 local-change-retry=${localChangeRestarts} paths=${dirtyAfterFetch.join(", ")}`);
+          await this.waitForLocalChangeStability();
+          continue;
+        }
+
+        let conflicts = await this.mergeRemote(fetchHead, log);
+
+        // ── 3. Push ─────────────────────────────────────────────────────────────
+        if (conflicts.length === 0) {
+          conflicts = await this.pushWithRetry(log, short);
+        }
+
+        log(`sync() OK conflicts=${conflicts.length}`);
+        let changes: SyncChangeCounts | undefined;
+        if (conflicts.length === 0) {
+          try {
+            changes = await this.countTreeChanges(beforeHead, await this.currentHead());
+          } catch (error) {
+            // The sync itself is already complete. A best-effort UI summary must
+            // never turn a successful push into a reported synchronization error.
+            log(`summary unavailable: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        return { success: conflicts.length === 0, conflictFiles: conflicts, logs, changes };
       }
-      return { success: conflicts.length === 0, conflictFiles: conflicts, logs, changes };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       log(`sync() FAILED: ${msg}`);
       return { success: false, conflictFiles: [], error: msg, logs };
     }
+  }
+
+  /** Short, bounded settling window before re-snapshotting local bytes. */
+  private async waitForLocalChangeStability(): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, LOCAL_CHANGE_STABILITY_DELAY_MS));
   }
 
   private async currentHead(): Promise<string | null> {
