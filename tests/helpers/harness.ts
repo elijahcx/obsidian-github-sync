@@ -18,6 +18,8 @@ export async function git(args: string[], cwd?: string): Promise<string> {
 }
 
 export class LocalAdapter {
+  rejectRenameOverExisting = false;
+  renameCalls = 0;
   constructor(public basePath: string) {}
 
   private abs(p: string): string {
@@ -44,6 +46,10 @@ export class LocalAdapter {
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
+    this.renameCalls++;
+    if (this.rejectRenameOverExisting && existsSync(this.abs(newPath))) {
+      throw new Error("Destination file already exists!");
+    }
     await mkdir(path.dirname(this.abs(newPath)), { recursive: true });
     await rename(this.abs(oldPath), this.abs(newPath));
   }

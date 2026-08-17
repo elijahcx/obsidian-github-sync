@@ -12,6 +12,7 @@ function pluginFixture(options: {
   inspectError?: Error;
   busy?: boolean;
   saveError?: Error;
+  adoptError?: Error;
 } = {}) {
   const plugin = Object.create(MultiSyncPlugin.prototype) as MultiSyncPlugin & Record<string, unknown>;
   let saves = 0;
@@ -31,7 +32,10 @@ function pluginFixture(options: {
         if (options.inspectError) throw options.inspectError;
         return { local: options.local ?? null, remote: options.remote ?? null };
       },
-      adoptSelectiveConfigRemote: async () => { adoptions++; },
+      adoptSelectiveConfigRemote: async () => {
+        adoptions++;
+        if (options.adoptError) throw options.adoptError;
+      },
       restoreSelectiveConfigAfterPersistenceFailure: async () => { restores++; },
     },
     saveSettings: async () => { saves++; if (options.saveError) throw options.saveError; },
@@ -105,4 +109,16 @@ test("settings persistence failure rolls back a materialized remote file", async
   assert.equal(await fixture.plugin.requestSelectiveConfigChange("syncObsidianFilesAndLinks", true), false);
   assert.equal(fixture.settings.syncObsidianFilesAndLinks, false);
   assert.deepEqual(fixture.counts(), { saves: 1, adoptions: 1, prompts: 0, restores: 1 });
+});
+
+test("provider replacement failure leaves the category off", async () => {
+  const fixture = pluginFixture({
+    local: new Uint8Array([1]),
+    remote: new Uint8Array([2]),
+    choice: "synced",
+    adoptError: new Error("provider replacement failed"),
+  });
+  assert.equal(await fixture.plugin.requestSelectiveConfigChange("syncObsidianFilesAndLinks", true), false);
+  assert.equal(fixture.settings.syncObsidianFilesAndLinks, false);
+  assert.deepEqual(fixture.counts(), { saves: 0, adoptions: 1, prompts: 1, restores: 0 });
 });

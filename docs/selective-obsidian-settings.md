@@ -33,8 +33,8 @@ merge, conflict UI, non-forced push, and recovery behavior used by vault notes.
 Consequently, simultaneous edits are not resolved last-writer-wins: a textual
 merge is accepted only when Git can merge it, and overlapping edits are shown
 as a conflict without silently choosing either device. Obsidian rewrites during
-a sync remain ordinary concurrent working-tree changes and fail visibly under
-the existing dirty-file safeguards; this feature adds no special retry loop.
+a fetch remain protected by the existing dirty-file guard and its bounded,
+pre-merge restart; continuously changing files still fail visibly.
 
 ## Enabling a category on another device
 
@@ -52,6 +52,14 @@ and merely enables normal participation; it does not force-push, rewrite Git
 history, or bypass later conflict detection. **Cancel** changes nothing. If the
 remote cannot be checked (including while offline), or local settings change
 while the prompt is open, the category stays disabled and the user can retry.
+
+### macOS adoption smoke test
+
+With **Files & links** off, make the Mac's local `app.json` differ from the
+already-synced version. Enable **Files & links**, choose **Use synced settings**,
+and confirm there is no “Destination file already exists!” error, the Mac file
+exactly matches the synced bytes, and the toggle remains on. A subsequent
+**Sync Now** must complete normally.
 
 ## Recommended desktop setup
 

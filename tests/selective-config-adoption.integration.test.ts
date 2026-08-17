@@ -58,13 +58,61 @@ test("differing device can adopt synced bytes without a push", async () => {
     const deviceB = await makeDevice(remote.url, root, "adopt-synced", exclusion(".obsidian", off));
     await deviceB.write(".obsidian/app.json", "device B\n");
     await deviceB.sync.clone();
+    // Match the macOS provider behavior that exposed the original bug. Adoption
+    // must replace via DataAdapter.writeBinary, never rename over app.json.
+    deviceB.adapter.rejectRenameOverExisting = true;
     const before = await git(["--git-dir", remote.remotePath, "rev-parse", "main"]);
     const snapshot = await deviceB.sync.inspectSelectiveConfig("app.json");
     assert.equal(text(snapshot.local), "device B\n");
     assert.equal(text(snapshot.remote), "device A\n");
     await deviceB.sync.adoptSelectiveConfigRemote("app.json", snapshot.local, snapshot.remote!);
     assert.equal(await deviceB.read(".obsidian/app.json"), "device A\n");
+    assert.equal(deviceB.adapter.renameCalls, 0);
     assert.equal(await git(["--git-dir", remote.remotePath, "rev-parse", "main"]), before);
+  });
+});
+
+test("provider replacement failure preserves existing app.json", async () => {
+  await withRemote({ ".obsidian/app.json": "remote\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "adoption-write-failure", exclusion(".obsidian", off));
+    await device.sync.clone();
+    await device.write(".obsidian/app.json", "original local\n");
+    const snapshot = await device.sync.inspectSelectiveConfig("app.json");
+    const writeBinary = device.adapter.writeBinary.bind(device.adapter);
+    device.adapter.writeBinary = async (path, data) => {
+      if (path === ".obsidian/app.json") throw new Error("provider replacement failed");
+      await writeBinary(path, data);
+    };
+    await assert.rejects(
+      device.sync.adoptSelectiveConfigRemote("app.json", snapshot.local, snapshot.remote!),
+      /provider replacement failed/
+    );
+    assert.equal(await device.read(".obsidian/app.json"), "original local\n");
+    assert.equal(device.adapter.renameCalls, 0);
+  });
+});
+
+test("partial provider write is rolled back to the original bytes", async () => {
+  await withRemote({ ".obsidian/app.json": "remote\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "adoption-partial-write", exclusion(".obsidian", off));
+    await device.sync.clone();
+    await device.write(".obsidian/app.json", "original local\n");
+    const snapshot = await device.sync.inspectSelectiveConfig("app.json");
+    const writeBinary = device.adapter.writeBinary.bind(device.adapter);
+    let first = true;
+    device.adapter.writeBinary = async (path, data) => {
+      if (path === ".obsidian/app.json" && first) {
+        first = false;
+        await writeBinary(path, new TextEncoder().encode("partial").buffer);
+        throw new Error("provider failed after partial write");
+      }
+      await writeBinary(path, data);
+    };
+    await assert.rejects(
+      device.sync.adoptSelectiveConfigRemote("app.json", snapshot.local, snapshot.remote!),
+      /provider failed after partial write/
+    );
+    assert.equal(await device.read(".obsidian/app.json"), "original local\n");
   });
 });
 
