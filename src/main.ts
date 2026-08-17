@@ -6,7 +6,7 @@ import { ConflictModal } from "./ui/conflict-modal";
 import { GitSync } from "./sync/git-sync";
 import { SyncQueue } from "./sync/queue";
 import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename } from "./sync/events";
-import { normalizeGitPath } from "./sync/paths";
+import { isBuiltInIgnoredPath, matchesExcludePattern, normalizeGitPath } from "./sync/paths";
 import { persistResolutionMetadata } from "./sync/resolution-completion";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
 import { REMOTE_POLL_INTERVAL_MS } from "./constants";
@@ -455,12 +455,8 @@ export default class MultiSyncPlugin extends Plugin {
 
   private isExcluded(filepath: string): boolean {
     filepath = normalizeGitPath(filepath);
-    return this.settings.excludePatterns.some((pattern) => {
-      // Convert simple glob pattern (supports *) to regex
-      const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-      const regexStr = escaped.replace(/\*/g, ".*");
-      return new RegExp(`^${regexStr}$`).test(filepath);
-    });
+    return isBuiltInIgnoredPath(filepath) ||
+      this.settings.excludePatterns.some((pattern) => matchesExcludePattern(filepath, pattern));
   }
 
   getDiagnostics(): SyncDiagnostics {

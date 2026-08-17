@@ -5,7 +5,7 @@ import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename 
 import { SyncQueue } from "../src/sync/queue";
 import type { GitSync } from "../src/sync/git-sync";
 import type { SyncStatus } from "../src/types";
-import { normalizeGitPath, normalizeVaultPath } from "../src/sync/paths";
+import { isBuiltInIgnoredPath, matchesExcludePattern, normalizeGitPath, normalizeVaultPath } from "../src/sync/paths";
 import { createFsAdapter } from "../src/sync/fs-adapter";
 import { LocalAdapter } from "./helpers/harness";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 const excluded = (path: string) => path === ".obsidian" || path.startsWith(".obsidian/");
+const excludedWithBuiltIns = (path: string) => isBuiltInIgnoredPath(path) || excluded(path);
 
 function recordingQueue(): { paths: string[]; enqueue: (path: string) => void } {
   const paths: string[] = [];
@@ -30,6 +31,30 @@ test("Git paths and Windows vault roots are normalized centrally", () => {
   assert.equal(normalizeGitPath("./folder//name with spaces.md"), "folder/name with spaces.md");
   assert.equal(normalizeVaultPath("C:\\Users\\Test\\Vault\\"), "C:/Users/Test/Vault");
   assert.equal(normalizeVaultPath(""), "");
+});
+
+test("user exclusion patterns retain anchored, case-sensitive star semantics", () => {
+  assert.equal(matchesExcludePattern(".DS_Store", ".DS_Store"), true);
+  assert.equal(matchesExcludePattern("Folder/.DS_Store", ".DS_Store"), false);
+  assert.equal(matchesExcludePattern("Folder/.DS_Store", "*/.DS_Store"), true);
+  assert.equal(matchesExcludePattern(".DS_Store", "*/.DS_Store"), false);
+});
+
+test("built-in OS metadata names are ignored at every depth without hiding other dotfiles", () => {
+  for (const filepath of [
+    ".DS_Store", "Folder/.DS_Store", "Thumbs.db", "nested/THUMBS.DB", "thumbs.db",
+    "desktop.ini", "nested/Desktop.ini", "DESKTOP.INI",
+  ]) assert.equal(isBuiltInIgnoredPath(filepath), true, filepath);
+  for (const filepath of [".ds_store", ".hidden", "notes/desktop.ini.md", "Thumbs.db.md"])
+    assert.equal(isBuiltInIgnoredPath(filepath), false, filepath);
+});
+
+test("OS metadata create, modify, delete, and rename events do not enter the queue", () => {
+  const queue = recordingQueue();
+  for (const filepath of [".DS_Store", "Folder/.DS_Store", "Thumbs.db", "nested/THUMBS.DB", "Desktop.ini"])
+    enqueueDelete(queue, filepath, excludedWithBuiltIns);
+  enqueueRename(queue, ".DS_Store", "Folder/.DS_Store", excludedWithBuiltIns);
+  assert.deepEqual(queue.paths, []);
 });
 
 test("Windows-style absolute Git paths become relative only at the DataAdapter boundary", async () => {
@@ -133,6 +158,16 @@ function queueWithSync(debounceMs?: number): { queue: SyncQueue; calls: string[]
 test("SyncQueue preserves the default debounce value", () => {
   const { queue } = queueWithSync();
   assert.equal(queue.getDebounceMs(), SYNC_DEBOUNCE_MS);
+});
+
+test("SyncQueue defensively rejects built-in metadata events", () => {
+  const { queue } = queueWithSync(10_000);
+  queue.enqueue(".DS_Store");
+  queue.enqueue("Folder/.DS_Store");
+  queue.enqueue("THUMBS.DB");
+  queue.enqueue("Desktop.ini");
+  assert.deepEqual(queue.getPendingFiles(), []);
+  assert.equal(queue.getDiagnostics().debouncePending, false);
 });
 
 test("SyncQueue exposes an immutable filename-free diagnostic snapshot", async () => {

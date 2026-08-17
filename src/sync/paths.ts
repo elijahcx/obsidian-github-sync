@@ -8,6 +8,20 @@ export function normalizeGitPath(filepath: string): string {
     .replace(/\/$/, "");
 }
 
+/** Operating-system bookkeeping files that are never vault content. */
+export function isBuiltInIgnoredPath(filepath: string): boolean {
+  const basename = normalizeGitPath(filepath).split("/").pop() ?? "";
+  if (basename === ".DS_Store") return true;
+  const windowsName = basename.toLowerCase();
+  return windowsName === "thumbs.db" || windowsName === "desktop.ini";
+}
+
+/** Match the plugin's intentionally small, anchored `*` pattern language. */
+export function matchesExcludePattern(filepath: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`).test(normalizeGitPath(filepath));
+}
+
 /** Canonical root used by isomorphic-git; DataAdapter remains the native boundary. */
 export function normalizeVaultPath(vaultPath: string): string {
   if (vaultPath === "") return "";

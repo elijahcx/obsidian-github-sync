@@ -97,6 +97,24 @@ test("dirty unqueued file appearing during fetch is never overwritten", async ()
   });
 });
 
+test("OS metadata changing during fetch is ignored while normal dirty-file safety remains active", async () => {
+  await withRemote({ "note.md": "base\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "metadata-dirty-device");
+    await device.sync.clone();
+    await device.write(".DS_Store", "before\n");
+    const internals = device.sync as unknown as { safeFetch: () => Promise<string | null> };
+    const realFetch = internals.safeFetch.bind(device.sync);
+    internals.safeFetch = async () => {
+      const head = await realFetch();
+      await device.write(".DS_Store", "changed during fetch\n");
+      return head;
+    };
+    const result = await device.sync.sync([]);
+    assert.equal(result.success, true, result.error);
+    assert.equal(await device.read(".DS_Store"), "changed during fetch\n");
+  });
+});
+
 test("checkout materialization failure fails sync and does not push local merge", async () => {
   await withRemote({ "a.md": "a0\n", "b.md": "b0\n" }, async ({ remote, root }) => {
     const source = await makeDevice(remote.url, root, "checkout-source");
