@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Notice } from "obsidian";
-import { MultiSyncSettingsTab, renderDeviceFlowPanel } from "../src/ui/settings-tab";
+import { GitSyncVaultSettingsTab, renderDeviceFlowPanel } from "../src/ui/settings-tab";
 import type { DeviceFlowResponse } from "../src/types";
 
 Object.defineProperty(globalThis, "window", {
@@ -89,7 +89,7 @@ function fakeTab(options: {
     initializeRepo: async () => {},
     saveSettings: async () => {},
   };
-  const tab = Object.create(MultiSyncSettingsTab.prototype) as MultiSyncSettingsTab & Record<string, unknown>;
+  const tab = Object.create(GitSyncVaultSettingsTab.prototype) as GitSyncVaultSettingsTab & Record<string, unknown>;
   Object.assign(tab, {
     plugin,
     containerEl: container,
@@ -103,7 +103,7 @@ function fakeTab(options: {
   return { tab, container, settings };
 }
 
-async function start(tab: MultiSyncSettingsTab, btn: FakeButton): Promise<void> {
+async function start(tab: GitSyncVaultSettingsTab, btn: FakeButton): Promise<void> {
   await (tab as unknown as { startDeviceFlow(btn: FakeButton): Promise<void> }).startDeviceFlow(btn);
 }
 

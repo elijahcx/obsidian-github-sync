@@ -1,6 +1,6 @@
 import { Plugin, Notice, TFile, TFolder, TAbstractFile, Modal } from "obsidian";
 import { PluginSettings, DEFAULT_SETTINGS, SyncStatus, ConflictFile } from "./types";
-import { MultiSyncSettingsTab } from "./ui/settings-tab";
+import { GitSyncVaultSettingsTab } from "./ui/settings-tab";
 import { StatusBarItem } from "./ui/status-bar";
 import { ConflictModal } from "./ui/conflict-modal";
 import { GitSync } from "./sync/git-sync";
@@ -20,7 +20,7 @@ import { isSelectivelyExcluded } from "./sync/selective-config";
 import { SELECTIVE_CONFIG_FILES, SelectiveConfigKey } from "./sync/selective-config";
 import { SelectiveConfigAdoptionChoice, SelectiveConfigAdoptionModal } from "./ui/selective-config-adoption-modal";
 
-export default class MultiSyncPlugin extends Plugin {
+export default class GitSyncVaultPlugin extends Plugin {
   settings!: PluginSettings;
   private statusBar!: StatusBarItem;
   private gitSync: GitSync | null = null;
@@ -43,7 +43,7 @@ export default class MultiSyncPlugin extends Plugin {
     this.statusBar = new StatusBarItem(this);
     this.statusBar.onClick(() => this.handleStatusBarClick());
 
-    this.addSettingTab(new MultiSyncSettingsTab(this.app, this));
+    this.addSettingTab(new GitSyncVaultSettingsTab(this.app, this));
 
     // Keyboard command
     this.addCommand({
