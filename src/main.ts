@@ -6,7 +6,7 @@ import { ConflictModal } from "./ui/conflict-modal";
 import { GitSync } from "./sync/git-sync";
 import { SyncQueue } from "./sync/queue";
 import { enqueueDelete, enqueueFolderDelete, enqueueFolderRename, enqueueRename } from "./sync/events";
-import { isBuiltInIgnoredPath, matchesExcludePattern, normalizeGitPath } from "./sync/paths";
+import { isBuiltInIgnoredPath, normalizeGitPath } from "./sync/paths";
 import { persistResolutionMetadata } from "./sync/resolution-completion";
 import { repoExists, createRepo, vaultNameToRepoName } from "./github/api";
 import { REMOTE_POLL_INTERVAL_MS } from "./constants";
@@ -16,6 +16,7 @@ import { EMPTY_POLL_DIAGNOSTICS, EMPTY_QUEUE_DIAGNOSTICS, SyncDiagnostics } from
 import { classifySyncResult } from "./sync/result-classification";
 import { presentManualSyncResult } from "./sync/manual-sync-summary";
 import { activateAfterStartupReconciliation, vaultPathForAdapter } from "./startup-lifecycle";
+import { isSelectivelyExcluded } from "./sync/selective-config";
 
 export default class MultiSyncPlugin extends Plugin {
   settings!: PluginSettings;
@@ -456,7 +457,13 @@ export default class MultiSyncPlugin extends Plugin {
   private isExcluded(filepath: string): boolean {
     filepath = normalizeGitPath(filepath);
     return isBuiltInIgnoredPath(filepath) ||
-      this.settings.excludePatterns.some((pattern) => matchesExcludePattern(filepath, pattern));
+      isSelectivelyExcluded(
+        filepath,
+        this.app.vault.configDir,
+        this.manifest.id,
+        this.settings,
+        this.settings.excludePatterns
+      );
   }
 
   getDiagnostics(): SyncDiagnostics {

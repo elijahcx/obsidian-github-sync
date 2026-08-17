@@ -178,11 +178,16 @@ export class GitHttpRemote {
   }
 }
 
-export async function makeDevice(remoteUrl: string, root: string, name: string): Promise<Device> {
+export async function makeDevice(
+  remoteUrl: string,
+  root: string,
+  name: string,
+  isExcluded: (filepath: string) => boolean = exclude
+): Promise<Device> {
   const dir = path.join(root, name);
   await mkdir(dir, { recursive: true });
   const adapter = new LocalAdapter(dir);
-  const sync = new GitSync(adapter as never, dir, "token", "test-user", "remote", exclude);
+  const sync = new GitSync(adapter as never, dir, "token", "test-user", "remote", isExcluded);
   (sync as unknown as { remoteUrl: string }).remoteUrl = remoteUrl;
   return {
     name,

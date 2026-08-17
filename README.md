@@ -136,8 +136,11 @@ The default exclusion is:
 
 This keeps device-specific Obsidian settings, workspace layout, plugin data, and
 installed plugin files local to each device. Keeping this exclusion is recommended
-for cross-device use. You may remove it if you intentionally want to synchronize
-Obsidian configuration and accept the additional conflict risk.
+for cross-device use. The **Selected Obsidian settings** controls can explicitly
+include only reviewed `app.json`, `hotkeys.json`, or `appearance.json` files while
+the rest of the directory remains excluded. All three options default off. See
+the [selective settings audit](docs/selective-obsidian-settings.md) for the exact
+file contents, portability tradeoffs, and security model.
 
 Add other paths or `*` patterns under **Settings → Git Sync Vault → Excluded
 patterns**, one per line. Configure exclusions before the first sync when
