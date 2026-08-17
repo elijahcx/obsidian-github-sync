@@ -8,10 +8,9 @@ import {
 } from "../constants";
 import { ConflictChoice, ConflictFile, ConflictResolutionResult, SyncChangeCounts, SyncResult } from "../types";
 import { isBuiltInIgnoredPath, isSafeRelativePath, isSafeSnapshotBasename, normalizeGitPath, normalizeVaultPath } from "./paths";
+import type { SelectiveConfigFilename } from "./selective-config";
 
 const MAX_PUSH_ATTEMPTS = 3;
-const MAX_LOCAL_CHANGE_RESTARTS = 2;
-const LOCAL_CHANGE_STABILITY_DELAY_MS = 350;
 let nextConflictSession = 1;
 const RECOVERY_SCHEMA_VERSION = 1;
 const RECOVERY_DIR = ".git/obsidian-sync-recovery";
@@ -149,6 +148,7 @@ type PendingMerge = {
 };
 
 export class GitSync {
+  private adapter: DataAdapter;
   private fs: ReturnType<typeof createFsAdapter>;
   private dir: string;
   private token: string;
@@ -160,6 +160,7 @@ export class GitSync {
   private pendingMerge: PendingMerge | null = null;
   /** Paths the user excluded from sync; never staged, never treated as conflicts. */
   private isExcluded: (filepath: string) => boolean;
+  private configDir: string;
 
   constructor(
     adapter: DataAdapter,
@@ -167,8 +168,10 @@ export class GitSync {
     token: string,
     username: string,
     repoName: string,
-    isExcluded: (filepath: string) => boolean = () => false
+    isExcluded: (filepath: string) => boolean = () => false,
+    configDir = ".obsidian"
   ) {
+    this.adapter = adapter;
     const normalizedVaultPath = normalizeVaultPath(vaultPath);
     this.fs = createFsAdapter(adapter, normalizedVaultPath);
     this.dir = normalizedVaultPath;
@@ -179,7 +182,135 @@ export class GitSync {
       const normalized = normalizeGitPath(filepath);
       return isBuiltInIgnoredPath(normalized) || isExcluded(normalized);
     };
+    this.configDir = normalizeGitPath(configDir);
     this.mutex = mutexFor(adapter, normalizedVaultPath);
+  }
+
+  /** Inspect one reviewed config file against a freshly fetched remote tree. */
+  async inspectSelectiveConfig(filename: SelectiveConfigFilename): Promise<{
+    local: Uint8Array | null;
+    remote: Uint8Array | null;
+  }> {
+    return this.mutex.run(async () => {
+      this.assertReviewedConfigFilename(filename);
+      await this.recoverInterruptedOperation();
+      if (this.pendingMerge) throw new Error("Resolve the current sync conflict before enabling settings sync.");
+      this.lastFetchError = null;
+      const remoteHead = await this.safeFetch();
+      if (remoteHead === null && this.lastFetchError) throw new Error(this.lastFetchError);
+      const path = `${this.configDir}/${filename}`;
+      return {
+        local: await this.readWorkingBytes(path),
+        remote: remoteHead ? await this.readOptionalBlob(remoteHead, path) : null,
+      };
+    });
+  }
+
+  /**
+   * Atomically adopt fetched bytes, but only if both sides still equal the
+   * snapshots shown to the user. A fresh fetch prevents stale modal decisions.
+   */
+  async adoptSelectiveConfigRemote(
+    filename: SelectiveConfigFilename,
+    expectedLocal: Uint8Array | null,
+    expectedRemote: Uint8Array
+  ): Promise<void> {
+    return this.mutex.run(async () => {
+      this.assertReviewedConfigFilename(filename);
+      await this.recoverInterruptedOperation();
+      if (this.pendingMerge) throw new Error("Resolve the current sync conflict before enabling settings sync.");
+      this.lastFetchError = null;
+      const remoteHead = await this.safeFetch();
+      if (!remoteHead) throw new Error(this.lastFetchError ?? "The synced settings version is no longer available.");
+      const path = `${this.configDir}/${filename}`;
+      const [localNow, remoteNow] = await Promise.all([
+        this.readWorkingBytes(path),
+        this.readOptionalBlob(remoteHead, path),
+      ]);
+      if (!this.sameOptionalBytes(localNow, expectedLocal)) {
+        throw new Error("Local settings changed while choosing a version. Try again.");
+      }
+      if (!remoteNow || !this.sameBytes(remoteNow, expectedRemote)) {
+        throw new Error("Synced settings changed while choosing a version. Try again.");
+      }
+      await this.writeWorkingBytesAtomically(path, remoteNow, expectedLocal);
+    });
+  }
+
+  /** Roll back a completed adoption if the later settings persistence fails. */
+  async restoreSelectiveConfigAfterPersistenceFailure(
+    filename: SelectiveConfigFilename,
+    adoptedRemote: Uint8Array,
+    originalLocal: Uint8Array | null
+  ): Promise<void> {
+    return this.mutex.run(async () => {
+      this.assertReviewedConfigFilename(filename);
+      const path = `${this.configDir}/${filename}`;
+      if (!this.sameOptionalBytes(await this.readWorkingBytes(path), adoptedRemote)) {
+        throw new Error("Local settings changed before adoption could be rolled back.");
+      }
+      if (originalLocal === null) {
+        await this.adapter.remove(path);
+      } else {
+        await this.writeWorkingBytesAtomically(path, originalLocal, adoptedRemote);
+      }
+    });
+  }
+
+  private async readWorkingBytes(path: string): Promise<Uint8Array | null> {
+    try {
+      const value = await this.fs.promises.readFile(this.repoPath(path));
+      return new Uint8Array(Buffer.from(value));
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  private assertReviewedConfigFilename(filename: string): asserts filename is SelectiveConfigFilename {
+    if (filename !== "app.json" && filename !== "hotkeys.json" && filename !== "appearance.json") {
+      throw new Error("Selective settings adoption is limited to reviewed Obsidian configuration files.");
+    }
+  }
+
+  private async readOptionalBlob(oid: string, path: string): Promise<Uint8Array | null> {
+    try {
+      const { blob } = await git.readBlob({ fs: this.fs, dir: this.dir, oid, filepath: path });
+      return new Uint8Array(blob);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/not.?found|does not exist|Could not find/i.test(message)) return null;
+      throw error;
+    }
+  }
+
+  private sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && a.every((byte, index) => byte === b[index]);
+  }
+
+  private sameOptionalBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
+    return a === null || b === null ? a === b : this.sameBytes(a, b);
+  }
+
+  private async writeWorkingBytesAtomically(
+    path: string,
+    bytes: Uint8Array,
+    expectedLocal: Uint8Array | null
+  ): Promise<void> {
+    const temporary = `${path}.gitsyncvault-adoption-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const adapter = this.adapter;
+    try {
+      const copy = new Uint8Array(bytes);
+      await adapter.writeBinary(temporary, copy.buffer);
+      // The temp write may itself take time on a mobile/provider-backed vault.
+      // Revalidate bytes immediately before the atomic rename boundary.
+      if (!this.sameOptionalBytes(await this.readWorkingBytes(path), expectedLocal)) {
+        throw new Error("Local settings changed while choosing a version. Try again.");
+      }
+      await adapter.rename(temporary, path);
+    } finally {
+      try { if (await adapter.exists(temporary)) await adapter.remove(temporary); } catch { /* best-effort temp cleanup */ }
+    }
   }
 
   /** Base options shared by ALL git operations (local and network) */
@@ -816,108 +947,87 @@ export class GitSync {
     const logs: string[] = [];
     const log = (m: string) => { logs.push(m); };
     const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
-    const candidates = new Set(changedFiles);
-    let localChangeRestarts = 0;
+
+    log(`sync() start — ${changedFiles.length} candidate files`);
 
     try {
       const beforeHead = await this.currentHead();
-      while (true) {
-        log(`sync() start — ${candidates.size} candidate files`);
-        // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
-        const filesToStage = await this.expandChangedPaths([...candidates]);
-        await this.preserveExcludedIndexEntries();
-        for (const file of filesToStage) {
-          await this.stagePath(file);
-        }
-
-        // Commit ONLY if the staged tree differs from HEAD. Otherwise we'd create a
-        // phantom commit that advances local HEAD past the remote for no reason.
-        const hasLocal = await this.hasLocalBranch();
-        let stagedChange = false;
-        try {
-          const matrix = await this.trackedStatus();
-          stagedChange = matrix.some(([, head, , stage]) => stage !== head);
-        } catch {
-          stagedChange = candidates.size > 0; // unborn branch / status unavailable
-        }
-        const mustCommit = stagedChange || !hasLocal;
-        log(`step1 stagedChange=${stagedChange} hasLocal=${hasLocal} commit=${mustCommit}`);
-
-        if (mustCommit) {
-          const now = new Date().toISOString().replace("T", " ").slice(0, 19);
-          if (!hasLocal) {
-            log(`step1 establishing initial ${DEFAULT_BRANCH}`);
-            const oid = await this.establishInitialMain(`sync: ${now}`);
-            log(`step1 ${DEFAULT_BRANCH}=${short(oid)}`);
-          } else {
-            const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
-            log(`step1 committed=${short(oid)}`);
-          }
-        }
-
-        if (!(await this.hasLocalBranch())) {
-          throw new Error(`Sync initialization failed: could not establish local branch '${DEFAULT_BRANCH}'.`);
-        }
-
-        // ── 2. Fetch + merge remote ─────────────────────────────────────────────
-        this.lastFetchError = null;
-        const fetchHead = await this.safeFetch();
-        log(`step2 fetchHead=${short(fetchHead)}`);
-        if (fetchHead === null && this.lastFetchError) {
-          log(`step2 ${this.lastFetchError}`);
-          throw new Error(this.lastFetchError);
-        }
-
-        const dirtyAfterFetch = (await this.trackedStatus())
-          .filter(([, head, workdir]) => workdir !== head)
-          .map(([filepath]) => filepath);
-        if (dirtyAfterFetch.length > 0) {
-          if (localChangeRestarts >= MAX_LOCAL_CHANGE_RESTARTS) {
-            throw new Error(`Local files changed during sync; retrying is required: ${dirtyAfterFetch.join(", ")}`);
-          }
-
-          // safeFetch only updates Git's remote-tracking data. mergeRemote (the
-          // first operation that can materialize incoming bytes), conflict setup,
-          // and push have not run yet, so the attempt can be abandoned without
-          // rolling back remote or working-tree state. Include every newly dirty
-          // participating path so the next attempt commits its newest bytes.
-          for (const path of dirtyAfterFetch) candidates.add(path);
-          localChangeRestarts++;
-          log(`step2 local-change-retry=${localChangeRestarts} paths=${dirtyAfterFetch.join(", ")}`);
-          await this.waitForLocalChangeStability();
-          continue;
-        }
-
-        let conflicts = await this.mergeRemote(fetchHead, log);
-
-        // ── 3. Push ─────────────────────────────────────────────────────────────
-        if (conflicts.length === 0) {
-          conflicts = await this.pushWithRetry(log, short);
-        }
-
-        log(`sync() OK conflicts=${conflicts.length}`);
-        let changes: SyncChangeCounts | undefined;
-        if (conflicts.length === 0) {
-          try {
-            changes = await this.countTreeChanges(beforeHead, await this.currentHead());
-          } catch (error) {
-            // The sync itself is already complete. A best-effort UI summary must
-            // never turn a successful push into a reported synchronization error.
-            log(`summary unavailable: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-        return { success: conflicts.length === 0, conflictFiles: conflicts, logs, changes };
+      // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
+      const filesToStage = await this.expandChangedPaths(changedFiles);
+      await this.preserveExcludedIndexEntries();
+      for (const file of filesToStage) {
+        await this.stagePath(file);
       }
+
+      // Commit ONLY if the staged tree differs from HEAD. Otherwise we'd create a
+      // phantom commit that advances local HEAD past the remote for no reason.
+      const hasLocal = await this.hasLocalBranch();
+      let stagedChange = false;
+      try {
+        const matrix = await this.trackedStatus();
+        stagedChange = matrix.some(([, head, , stage]) => stage !== head);
+      } catch {
+        stagedChange = changedFiles.length > 0; // unborn branch / status unavailable
+      }
+      const mustCommit = stagedChange || !hasLocal;
+      log(`step1 stagedChange=${stagedChange} hasLocal=${hasLocal} commit=${mustCommit}`);
+
+      if (mustCommit) {
+        const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+        if (!hasLocal) {
+          log(`step1 establishing initial ${DEFAULT_BRANCH}`);
+          const oid = await this.establishInitialMain(`sync: ${now}`);
+          log(`step1 ${DEFAULT_BRANCH}=${short(oid)}`);
+        } else {
+          const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
+          log(`step1 committed=${short(oid)}`);
+        }
+      }
+
+      if (!(await this.hasLocalBranch())) {
+        throw new Error(`Sync initialization failed: could not establish local branch '${DEFAULT_BRANCH}'.`);
+      }
+
+      // ── 2. Fetch + merge remote ─────────────────────────────────────────────
+      this.lastFetchError = null;
+      const fetchHead = await this.safeFetch();
+      log(`step2 fetchHead=${short(fetchHead)}`);
+      if (fetchHead === null && this.lastFetchError) {
+        log(`step2 ${this.lastFetchError}`);
+        throw new Error(this.lastFetchError);
+      }
+
+      const dirtyAfterFetch = (await this.trackedStatus())
+        .filter(([, head, workdir]) => workdir !== head)
+        .map(([filepath]) => filepath);
+      if (dirtyAfterFetch.length > 0) {
+        throw new Error(`Local files changed during sync; retrying is required: ${dirtyAfterFetch.join(", ")}`);
+      }
+
+      let conflicts = await this.mergeRemote(fetchHead, log);
+
+      // ── 3. Push ─────────────────────────────────────────────────────────────
+      if (conflicts.length === 0) {
+        conflicts = await this.pushWithRetry(log, short);
+      }
+
+      log(`sync() OK conflicts=${conflicts.length}`);
+      let changes: SyncChangeCounts | undefined;
+      if (conflicts.length === 0) {
+        try {
+          changes = await this.countTreeChanges(beforeHead, await this.currentHead());
+        } catch (error) {
+          // The sync itself is already complete. A best-effort UI summary must
+          // never turn a successful push into a reported synchronization error.
+          log(`summary unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { success: conflicts.length === 0, conflictFiles: conflicts, logs, changes };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       log(`sync() FAILED: ${msg}`);
       return { success: false, conflictFiles: [], error: msg, logs };
     }
-  }
-
-  /** Short, bounded settling window before re-snapshotting local bytes. */
-  private async waitForLocalChangeStability(): Promise<void> {
-    await new Promise<void>((resolve) => setTimeout(resolve, LOCAL_CHANGE_STABILITY_DELAY_MS));
   }
 
   private async currentHead(): Promise<string | null> {

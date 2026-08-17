@@ -6,6 +6,15 @@ export type SelectiveConfigSettings = Pick<
   "syncObsidianFilesAndLinks" | "syncObsidianHotkeys" | "syncObsidianAppearance"
 >;
 
+export const SELECTIVE_CONFIG_FILES = {
+  syncObsidianFilesAndLinks: { filename: "app.json", label: "Files & links" },
+  syncObsidianHotkeys: { filename: "hotkeys.json", label: "Hotkeys" },
+  syncObsidianAppearance: { filename: "appearance.json", label: "Appearance" },
+} as const;
+
+export type SelectiveConfigKey = keyof typeof SELECTIVE_CONFIG_FILES;
+export type SelectiveConfigFilename = typeof SELECTIVE_CONFIG_FILES[SelectiveConfigKey]["filename"];
+
 /** The complete, reviewed allow-list. Never accept user-provided config filenames here. */
 export function selectedConfigPaths(
   configDir: string,

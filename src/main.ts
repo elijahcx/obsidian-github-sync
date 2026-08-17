@@ -17,6 +17,8 @@ import { classifySyncResult } from "./sync/result-classification";
 import { presentManualSyncResult } from "./sync/manual-sync-summary";
 import { activateAfterStartupReconciliation, vaultPathForAdapter } from "./startup-lifecycle";
 import { isSelectivelyExcluded } from "./sync/selective-config";
+import { SELECTIVE_CONFIG_FILES, SelectiveConfigKey } from "./sync/selective-config";
+import { SelectiveConfigAdoptionChoice, SelectiveConfigAdoptionModal } from "./ui/selective-config-adoption-modal";
 
 export default class MultiSyncPlugin extends Plugin {
   settings!: PluginSettings;
@@ -32,6 +34,7 @@ export default class MultiSyncPlugin extends Plugin {
   private currentStatus: SyncStatus = "idle";
   private lastSuccessfulSyncAt: number | null = null;
   private vaultEventListenersRegistered = false;
+  private selectiveConfigAdoptionActive = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -202,7 +205,8 @@ export default class MultiSyncPlugin extends Plugin {
     const vaultPath = vaultPathForAdapter(adapter);
 
     const sync = new GitSync(adapter, vaultPath, token, username, repoName, (p) =>
-      this.isExcluded(p)
+      this.isExcluded(p),
+      this.app.vault.configDir
     );
 
     try {
@@ -263,7 +267,8 @@ export default class MultiSyncPlugin extends Plugin {
       githubToken,
       githubUsername,
       repoName,
-      (p) => this.isExcluded(p)
+      (p) => this.isExcluded(p),
+      this.app.vault.configDir
     );
 
     this.syncQueue = new SyncQueue(this.gitSync, (status, detail) => {
@@ -280,6 +285,71 @@ export default class MultiSyncPlugin extends Plugin {
   updateAutoSync(enabled: boolean): void {
     this.settings.autoSync = enabled;
     this.updateRemotePolling();
+  }
+
+  async requestSelectiveConfigChange(key: SelectiveConfigKey, enabled: boolean): Promise<boolean> {
+    if (!enabled) {
+      this.settings[key] = false;
+      await this.saveSettings();
+      return true;
+    }
+    if (this.selectiveConfigAdoptionActive) return false;
+    const sync = this.gitSync;
+    if (!sync) {
+      new Notice("Connect Git Sync Vault before enabling selected settings sync.");
+      return false;
+    }
+    if (this.foregroundOperations > 0 || this.conflictActive || !this.syncQueue?.isIdleForRemotePull()) {
+      new Notice("Wait for the current sync operation to finish, then try enabling this setting again.");
+      return false;
+    }
+
+    this.selectiveConfigAdoptionActive = true;
+    this.foregroundOperations++;
+    this.stopRemotePolling();
+    const { filename, label } = SELECTIVE_CONFIG_FILES[key];
+    let adoptedSnapshot: { local: Uint8Array | null; remote: Uint8Array } | null = null;
+    try {
+      const snapshot = await sync.inspectSelectiveConfig(filename);
+      const differs = snapshot.local !== null && snapshot.remote !== null &&
+        !sameBytes(snapshot.local, snapshot.remote);
+      let choice: SelectiveConfigAdoptionChoice = "local";
+      if (differs) choice = await this.chooseSelectiveConfigVersion(label);
+      if (choice === "cancel") return false;
+      if (choice === "synced" || (snapshot.local === null && snapshot.remote !== null)) {
+        await sync.adoptSelectiveConfigRemote(filename, snapshot.local, snapshot.remote!);
+        adoptedSnapshot = { local: snapshot.local, remote: snapshot.remote! };
+      }
+      this.settings[key] = true;
+      try {
+        await this.saveSettings();
+      } catch (error) {
+        this.settings[key] = false;
+        if (adoptedSnapshot) {
+          await sync.restoreSelectiveConfigAfterPersistenceFailure(
+            filename,
+            adoptedSnapshot.remote,
+            adoptedSnapshot.local
+          );
+        }
+        throw error;
+      }
+      return true;
+    } catch (error) {
+      this.settings[key] = false;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[git-sync] Could not enable ${label} settings sync: ${message}`);
+      new Notice(`Could not enable ${label} settings sync: ${message}`);
+      return false;
+    } finally {
+      this.foregroundOperations--;
+      this.selectiveConfigAdoptionActive = false;
+      this.updateRemotePolling();
+    }
+  }
+
+  private chooseSelectiveConfigVersion(categoryLabel: string): Promise<SelectiveConfigAdoptionChoice> {
+    return new Promise((resolve) => new SelectiveConfigAdoptionModal(this.app, categoryLabel, resolve).open());
   }
 
   disconnectSyncEngine(): void {
@@ -491,6 +561,10 @@ export default class MultiSyncPlugin extends Plugin {
   private refreshDiagnostics(): void {
     if (!this.unloading && this.statusBar) this.statusBar.setDiagnostics(this.getDiagnostics());
   }
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((byte, index) => byte === b[index]);
 }
 
 /**

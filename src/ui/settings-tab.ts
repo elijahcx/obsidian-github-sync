@@ -3,6 +3,7 @@ import type MultiSyncPlugin from "../main";
 import { requestDeviceCode, pollForToken } from "../auth/github-device";
 import { getAuthenticatedUser } from "../github/api";
 import type { DeviceFlowResponse } from "../types";
+import type { SelectiveConfigKey } from "../sync/selective-config";
 
 type DeviceFlowElement = HTMLElement & {
   createDiv(options?: { cls?: string }): DeviceFlowElement;
@@ -180,29 +181,14 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
       cls: "setting-item-description",
     });
 
-    new Setting(containerEl)
-      .setName("Files & links")
-      .setDesc("Sync app.json, including attachment, link-format, auto-update, and wikilink preferences. Also includes other Files & Links preferences stored in that file.")
-      .addToggle((toggle) => toggle.setValue(settings.syncObsidianFilesAndLinks).onChange(async (val) => {
-        settings.syncObsidianFilesAndLinks = val;
-        await this.plugin.saveSettings();
-      }));
+    this.addSelectiveConfigToggle(containerEl, "syncObsidianFilesAndLinks", "Files & links",
+      "Sync app.json, including attachment, link-format, auto-update, and wikilink preferences. Also includes other Files & Links preferences stored in that file.");
 
-    new Setting(containerEl)
-      .setName("Hotkeys")
-      .setDesc("Sync hotkeys.json. Opt in only after reviewing explicit Ctrl/Meta/Alt bindings on every operating system.")
-      .addToggle((toggle) => toggle.setValue(settings.syncObsidianHotkeys).onChange(async (val) => {
-        settings.syncObsidianHotkeys = val;
-        await this.plugin.saveSettings();
-      }));
+    this.addSelectiveConfigToggle(containerEl, "syncObsidianHotkeys", "Hotkeys",
+      "Sync hotkeys.json. Opt in only after reviewing explicit Ctrl/Meta/Alt bindings on every operating system.");
 
-    new Setting(containerEl)
-      .setName("Appearance")
-      .setDesc("Sync appearance.json preferences only. Themes and CSS snippet files are not included and must exist on each device.")
-      .addToggle((toggle) => toggle.setValue(settings.syncObsidianAppearance).onChange(async (val) => {
-        settings.syncObsidianAppearance = val;
-        await this.plugin.saveSettings();
-      }));
+    this.addSelectiveConfigToggle(containerEl, "syncObsidianAppearance", "Appearance",
+      "Sync appearance.json preferences only. Themes and CSS snippet files are not included and must exist on each device.");
 
     // ── Manual sync ───────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Manual Sync" });
@@ -224,6 +210,22 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
         cls: "setting-item-description",
       });
     }
+  }
+
+  private addSelectiveConfigToggle(
+    containerEl: HTMLElement,
+    key: SelectiveConfigKey,
+    name: string,
+    description: string
+  ): void {
+    new Setting(containerEl).setName(name).setDesc(description).addToggle((toggle) =>
+      toggle.setValue(this.plugin.settings[key]).onChange(async (enabled) => {
+        toggle.setDisabled(true);
+        const accepted = await this.plugin.requestSelectiveConfigChange(key, enabled);
+        toggle.setValue(accepted ? enabled : this.plugin.settings[key]);
+        toggle.setDisabled(false);
+      })
+    );
   }
 
   private async startDeviceFlow(btn: ButtonComponent): Promise<void> {

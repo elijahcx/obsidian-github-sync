@@ -5,6 +5,7 @@ fs.mkdirSync(dir, { recursive: true });
 fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ type: 'commonjs', main: 'index.js' }));
 fs.writeFileSync(path.join(dir, 'index.js'), `
 class DataAdapter {}
+class Plugin {}
 class FileSystemAdapter extends DataAdapter {
   constructor(basePath = '') { super(); this.basePath = basePath; }
   getBasePath() { return this.basePath; }
@@ -29,5 +30,5 @@ async function requestUrl(options) {
   try { json = text ? JSON.parse(text) : undefined; } catch {}
   return { status: res.status, headers: Object.fromEntries(res.headers.entries()), arrayBuffer, text, json };
 }
-module.exports = { DataAdapter, FileSystemAdapter, Modal, PluginSettingTab, Setting, Notice, ButtonComponent, requestUrl };
+module.exports = { DataAdapter, FileSystemAdapter, Modal, Plugin, PluginSettingTab, Setting, Notice, ButtonComponent, requestUrl };
 `);
