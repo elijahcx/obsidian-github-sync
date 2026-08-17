@@ -670,6 +670,23 @@ test("full sync discovers missed tracked deletions, including nested notes", asy
   });
 });
 
+test("manual reconciliation reports structured Git tree changes", async () => {
+  await withRemote({ "updated.md": "old\n", "removed.md": "remove\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "summary-counts");
+    await device.sync.clone();
+
+    const unchanged = await device.sync.syncAll(["updated.md", "removed.md"]);
+    assert.deepEqual(unchanged.changes, { added: 0, updated: 0, removed: 0 });
+
+    await device.write("added.md", "new\n");
+    await device.write("updated.md", "changed\n");
+    await device.adapter.remove("removed.md");
+    const changed = await device.sync.syncAll(["added.md", "updated.md"]);
+    assert.equal(changed.success, true, changed.error);
+    assert.deepEqual(changed.changes, { added: 1, updated: 1, removed: 1 });
+  });
+});
+
 test("full sync never treats excluded absence or provider stat failure as deletion", async () => {
   await withRemote({ "note.md": "keep\n", ".obsidian/workspace.json": "history\n" }, async ({ remote, root }) => {
     const device = await makeDevice(remote.url, root, "safe-full-delete");

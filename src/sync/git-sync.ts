@@ -6,7 +6,7 @@ import {
   GIT_AUTHOR_EMAIL,
   DEFAULT_BRANCH,
 } from "../constants";
-import { ConflictChoice, ConflictFile, ConflictResolutionResult, SyncResult } from "../types";
+import { ConflictChoice, ConflictFile, ConflictResolutionResult, SyncChangeCounts, SyncResult } from "../types";
 import { isSafeRelativePath, isSafeSnapshotBasename, normalizeGitPath, normalizeVaultPath } from "./paths";
 
 const MAX_PUSH_ATTEMPTS = 3;
@@ -815,6 +815,7 @@ export class GitSync {
     log(`sync() start — ${changedFiles.length} candidate files`);
 
     try {
+      const beforeHead = await this.currentHead();
       // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
       const filesToStage = await this.expandChangedPaths(changedFiles);
       await this.preserveExcludedIndexEntries();
@@ -875,12 +876,57 @@ export class GitSync {
       }
 
       log(`sync() OK conflicts=${conflicts.length}`);
-      return { success: conflicts.length === 0, conflictFiles: conflicts, logs };
+      let changes: SyncChangeCounts | undefined;
+      if (conflicts.length === 0) {
+        try {
+          changes = await this.countTreeChanges(beforeHead, await this.currentHead());
+        } catch (error) {
+          // The sync itself is already complete. A best-effort UI summary must
+          // never turn a successful push into a reported synchronization error.
+          log(`summary unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { success: conflicts.length === 0, conflictFiles: conflicts, logs, changes };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       log(`sync() FAILED: ${msg}`);
       return { success: false, conflictFiles: [], error: msg, logs };
     }
+  }
+
+  private async currentHead(): Promise<string | null> {
+    if (!(await this.hasLocalBranch())) return null;
+    return git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+  }
+
+  /** Compare synchronized Git trees, not vault events or diagnostic text. */
+  private async countTreeChanges(before: string | null, after: string | null): Promise<SyncChangeCounts> {
+    const changes: SyncChangeCounts = { added: 0, updated: 0, removed: 0 };
+    const snapshot = async (ref: string | null): Promise<Map<string, string>> => {
+      const blobs = new Map<string, string>();
+      if (!ref) return blobs;
+      await git.walk({
+        fs: this.fs,
+        dir: this.dir,
+        trees: [git.TREE({ ref })],
+        map: async (filepath, [entry]) => {
+          if (entry && filepath !== "." && !this.isExcluded(filepath) && await entry.type() === "blob") {
+            blobs.set(filepath, await entry.oid());
+          }
+        },
+      });
+      return blobs;
+    };
+    const [oldBlobs, newBlobs] = await Promise.all([snapshot(before), snapshot(after)]);
+    for (const [path, oid] of newBlobs) {
+      const oldOid = oldBlobs.get(path);
+      if (!oldOid) changes.added++;
+      else if (oldOid !== oid) changes.updated++;
+    }
+    for (const path of oldBlobs.keys()) {
+      if (!newBlobs.has(path)) changes.removed++;
+    }
+    return changes;
   }
 
   /**
