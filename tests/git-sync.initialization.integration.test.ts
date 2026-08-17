@@ -29,6 +29,18 @@ test("create-repo flow initializes newly created empty remote with main and firs
   });
 });
 
+test("initAndPush never stages built-in OS metadata", async () => {
+  await withEmptyRemote(async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "metadata-init");
+    await device.write("note.md", "included\n");
+    await device.write(".DS_Store", "finder\n");
+    await device.write("Folder/.DS_Store", "finder nested\n");
+    await device.write("THUMBS.DB", "windows\n");
+    await device.sync.initAndPush(["note.md", ".DS_Store", "Folder/.DS_Store", "THUMBS.DB"]);
+    assert.equal(await git(["--git-dir", remote.remotePath, "ls-tree", "-r", "--name-only", "main"]), "note.md");
+  });
+});
+
 test("initAndPush initializes an already-existing empty remote", async () => {
   await withEmptyRemote(async ({ remote, root }) => {
     const device = await makeDevice(remote.url, root, "existing-empty-remote");

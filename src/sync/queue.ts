@@ -1,7 +1,7 @@
 import { SYNC_DEBOUNCE_MS } from "../constants";
 import { GitSync } from "./git-sync";
 import { ConflictFile, QueueDiagnostics, SyncResult, SyncStatus } from "../types";
-import { normalizeGitPath } from "./paths";
+import { isBuiltInIgnoredPath, normalizeGitPath } from "./paths";
 import { classifySyncResult } from "./result-classification";
 
 type StatusCallback = (status: SyncStatus, detail?: string) => void;
@@ -34,7 +34,9 @@ export class SyncQueue {
 
   /** Enqueue a changed file path. Debounces before triggering sync. */
   enqueue(filepath: string): void {
-    this.pendingFiles.add(normalizeGitPath(filepath));
+    const normalized = normalizeGitPath(filepath);
+    if (isBuiltInIgnoredPath(normalized)) return;
+    this.pendingFiles.add(normalized);
     this.changed();
     if (this.shuttingDown || this.conflictPaused) return;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);

@@ -161,7 +161,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Excluded patterns")
-      .setDesc("One pattern per line. These files will never be synced.")
+      .setDesc("One pattern per line. Common OS metadata is ignored automatically.")
       .addTextArea((ta) =>
         ta
           .setValue(settings.excludePatterns.join("\n"))

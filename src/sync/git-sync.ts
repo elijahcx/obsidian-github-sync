@@ -7,7 +7,7 @@ import {
   DEFAULT_BRANCH,
 } from "../constants";
 import { ConflictChoice, ConflictFile, ConflictResolutionResult, SyncChangeCounts, SyncResult } from "../types";
-import { isSafeRelativePath, isSafeSnapshotBasename, normalizeGitPath, normalizeVaultPath } from "./paths";
+import { isBuiltInIgnoredPath, isSafeRelativePath, isSafeSnapshotBasename, normalizeGitPath, normalizeVaultPath } from "./paths";
 
 const MAX_PUSH_ATTEMPTS = 3;
 let nextConflictSession = 1;
@@ -173,7 +173,10 @@ export class GitSync {
     this.token = token;
     this.username = username;
     this.remoteUrl = `https://github.com/${username}/${repoName}.git`;
-    this.isExcluded = (filepath) => isExcluded(normalizeGitPath(filepath));
+    this.isExcluded = (filepath) => {
+      const normalized = normalizeGitPath(filepath);
+      return isBuiltInIgnoredPath(normalized) || isExcluded(normalized);
+    };
     this.mutex = mutexFor(adapter, normalizedVaultPath);
   }
 

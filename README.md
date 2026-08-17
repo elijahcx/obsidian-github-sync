@@ -144,6 +144,19 @@ patterns**, one per line. Configure exclusions before the first sync when
 possible; adding an exclusion does not erase an already committed path from Git
 history.
 
+Patterns are case-sensitive, anchored to the entire vault-relative path, and `*`
+matches any characters (including `/`). Thus `.DS_Store` matches only the vault
+root; the existing syntax needs both `.DS_Store` and `*/.DS_Store` to cover root
+and nested files. Git Sync Vault handles this particular case automatically:
+`.DS_Store` at any depth, plus case-insensitive Windows `Thumbs.db` and
+`desktop.ini` names, are built-in OS-metadata exclusions. Other dotfiles remain
+ordinary participating vault content.
+
+Built-in metadata uses the same excluded-path preservation behavior as user
+patterns. If metadata is already tracked, its repository entry is preserved and
+may advance with remote history, while the device-local file is left untouched;
+the plugin does not automatically delete it from the repository or Git history.
+
 ## Diagnostics
 
 Run **Git Sync Vault: Show sync diagnostics** from the Command Palette to inspect

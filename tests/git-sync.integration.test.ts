@@ -601,6 +601,30 @@ test("remote tracked excluded changes advance history without overwriting the lo
   });
 });
 
+test("tracked .DS_Store advances with remote history while preserving the local metadata file", async () => {
+  await withRemote({ ".DS_Store": "remote old\n", "note.md": "base\n" }, async ({ remote, root }) => {
+    const device = await makeDevice(remote.url, root, "tracked-metadata-device");
+    await device.write(".DS_Store", "local finder state\n");
+    assert.equal(await device.sync.clone(), true);
+    assert.equal(await device.read(".DS_Store"), "local finder state\n");
+
+    const sourceDir = path.join(root, "tracked-metadata-source");
+    await git(["clone", remote.url, sourceDir]);
+    await git(["config", "user.name", "Test"], sourceDir);
+    await git(["config", "user.email", "test@example.com"], sourceDir);
+    await writeFile(path.join(sourceDir, ".DS_Store"), "remote new\n");
+    await git(["add", ".DS_Store"], sourceDir);
+    await git(["commit", "-m", "remote metadata update"], sourceDir);
+    await git(["push", "origin", "main"], sourceDir);
+
+    const result = await device.sync.syncAll(["note.md", ".DS_Store"]);
+    assert.equal(result.success, true, result.error);
+    assert.equal(await device.read(".DS_Store"), "local finder state\n");
+    assert.deepEqual(result.changes, { added: 0, updated: 0, removed: 0 });
+    assert.equal(await git(["show", "HEAD:.DS_Store"], device.dir), "remote new");
+  });
+});
+
 test("divergent excluded tracked conflicts keep the remote tree and local working copy", async () => {
   await withRemote({ "note.md": "base\n", ".obsidian/workspace.json": "remote-v1\n" }, async ({ remote, root }) => {
     const a = await makeDevice(remote.url, root, "device-a");
