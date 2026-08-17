@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, lstat, writeFile, readdir, unlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, lstat, writeFile, readdir, unlink, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,6 +18,8 @@ export async function git(args: string[], cwd?: string): Promise<string> {
 }
 
 export class LocalAdapter {
+  rejectRenameOverExisting = false;
+  renameCalls = 0;
   constructor(public basePath: string) {}
 
   private abs(p: string): string {
@@ -41,6 +43,19 @@ export class LocalAdapter {
 
   async remove(p: string): Promise<void> {
     await unlink(this.abs(p));
+  }
+
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    this.renameCalls++;
+    if (this.rejectRenameOverExisting && existsSync(this.abs(newPath))) {
+      throw new Error("Destination file already exists!");
+    }
+    await mkdir(path.dirname(this.abs(newPath)), { recursive: true });
+    await rename(this.abs(oldPath), this.abs(newPath));
+  }
+
+  async exists(p: string): Promise<boolean> {
+    return existsSync(this.abs(p));
   }
 
   async mkdir(p: string): Promise<void> {
@@ -182,12 +197,13 @@ export async function makeDevice(
   remoteUrl: string,
   root: string,
   name: string,
-  isExcluded: (filepath: string) => boolean = exclude
+  isExcluded: (filepath: string) => boolean = exclude,
+  configDir = ".obsidian"
 ): Promise<Device> {
   const dir = path.join(root, name);
   await mkdir(dir, { recursive: true });
   const adapter = new LocalAdapter(dir);
-  const sync = new GitSync(adapter as never, dir, "token", "test-user", "remote", isExcluded);
+  const sync = new GitSync(adapter as never, dir, "token", "test-user", "remote", isExcluded, configDir);
   (sync as unknown as { remoteUrl: string }).remoteUrl = remoteUrl;
   return {
     name,

@@ -36,6 +36,31 @@ as a conflict without silently choosing either device. Obsidian rewrites during
 a sync remain ordinary concurrent working-tree changes and fail visibly under
 the existing dirty-file safeguards; this feature adds no special retry loop.
 
+## Enabling a category on another device
+
+The enable toggle does not change exclusion behavior or persist the category
+until Git Sync Vault has fetched the current remote tree and completed adoption.
+The reviewed file is compared byte-for-byte. If the remote file is absent, the
+category enables directly and a local file can be published by the next normal
+sync. If only the remote file exists, it is safely materialized first. Identical
+local and remote files enable without a prompt.
+
+When both files exist and differ, **Use synced settings** atomically replaces the
+local file only after both the local snapshot and freshly fetched remote bytes
+are revalidated. **Use this device's settings** leaves the local bytes untouched
+and merely enables normal participation; it does not force-push, rewrite Git
+history, or bypass later conflict detection. **Cancel** changes nothing. If the
+remote cannot be checked (including while offline), or local settings change
+while the prompt is open, the category stays disabled and the user can retry.
+
+### macOS adoption smoke test
+
+With **Files & links** off, make the Mac's local `app.json` differ from the
+already-synced version. Enable **Files & links**, choose **Use synced settings**,
+and confirm there is no “Destination file already exists!” error, the Mac file
+exactly matches the synced bytes, and the toggle remains on. A subsequent
+**Sync Now** must complete normally.
+
 ## Recommended desktop setup
 
 Keep the broad `Vault.configDir/*` exclusion. Enable **Files & links** on all
