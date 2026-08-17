@@ -14,6 +14,7 @@ import { RemotePoller } from "./sync/remote-poller";
 import { DiagnosticsModal } from "./ui/diagnostics-modal";
 import { EMPTY_POLL_DIAGNOSTICS, EMPTY_QUEUE_DIAGNOSTICS, SyncDiagnostics } from "./diagnostics";
 import { classifySyncResult } from "./sync/result-classification";
+import { presentManualSyncResult } from "./sync/manual-sync-summary";
 import { activateAfterStartupReconciliation, vaultPathForAdapter } from "./startup-lifecycle";
 
 export default class MultiSyncPlugin extends Plugin {
@@ -360,23 +361,21 @@ export default class MultiSyncPlugin extends Plugin {
         .filter((p) => !this.isExcluded(p));
 
       const result = await this.gitSync.syncAll(allFiles);
-      const outcome = classifySyncResult(result);
+      const outcome = presentManualSyncResult(result, {
+        conflict: (conflicts) => this.presentConflicts(conflicts),
+        success: (message) => new Notice(message),
+        error: (message, logs) => {
+          if (logs?.length) showLogModal(this.app, `Sync error: ${message}`, logs);
+          this.setStatus("error", message);
+          new Notice(`Sync failed: ${message}`);
+        },
+      });
 
-      // A conflict owns the UI until it is resolved or abandoned. In
-      // particular, do not leave a generic debug/error modal behind it for the
-      // same conflict-bearing result.
-      if (outcome.kind === "conflict") {
-        this.presentConflicts(outcome.conflicts);
-      } else if (outcome.kind === "success") {
-        if (result.logs?.length) showLogModal(this.app, "Sync OK", result.logs);
+      if (outcome === "success") {
         this.syncQueue?.resumeAfterConflict();
         this.markSuccessfulSync();
         await this.saveSettings();
         this.setStatus("idle");
-        new Notice("Vault synced successfully.");
-      } else {
-        if (result.logs?.length) showLogModal(this.app, `Sync error: ${outcome.message}`, result.logs);
-        this.setStatus("error", outcome.message);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

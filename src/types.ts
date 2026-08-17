@@ -112,4 +112,11 @@ export interface SyncResult {
   conflictFiles: ConflictFile[];
   error?: string;
   logs?: string[];  // step-by-step diagnostic trace (shown on mobile where no console is reachable)
+  changes?: SyncChangeCounts; // structured HEAD-to-HEAD changes applied by this sync
+}
+
+export interface SyncChangeCounts {
+  added: number;
+  updated: number;
+  removed: number;
 }
