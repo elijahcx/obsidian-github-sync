@@ -142,6 +142,12 @@ the rest of the directory remains excluded. All three options default off. See
 the [selective settings audit](docs/selective-obsidian-settings.md) for the exact
 file contents, portability tradeoffs, and security model.
 
+When enabling one of these categories on another device, Git Sync Vault first
+checks the latest synced file and compares its exact bytes with that device's
+local settings. If they differ, you explicitly choose which version to adopt.
+Choosing this device's version only makes it eligible for the next normal,
+conflict-safe sync; it is not a force overwrite of the remote repository.
+
 Add other paths or `*` patterns under **Settings → Git Sync Vault → Excluded
 patterns**, one per line. Configure exclusions before the first sync when
 possible; adding an exclusion does not erase an already committed path from Git

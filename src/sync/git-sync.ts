@@ -8,6 +8,7 @@ import {
 } from "../constants";
 import { ConflictChoice, ConflictFile, ConflictResolutionResult, SyncChangeCounts, SyncResult } from "../types";
 import { isBuiltInIgnoredPath, isSafeRelativePath, isSafeSnapshotBasename, normalizeGitPath, normalizeVaultPath } from "./paths";
+import type { SelectiveConfigFilename } from "./selective-config";
 
 const MAX_PUSH_ATTEMPTS = 3;
 let nextConflictSession = 1;
@@ -147,6 +148,7 @@ type PendingMerge = {
 };
 
 export class GitSync {
+  private adapter: DataAdapter;
   private fs: ReturnType<typeof createFsAdapter>;
   private dir: string;
   private token: string;
@@ -158,6 +160,7 @@ export class GitSync {
   private pendingMerge: PendingMerge | null = null;
   /** Paths the user excluded from sync; never staged, never treated as conflicts. */
   private isExcluded: (filepath: string) => boolean;
+  private configDir: string;
 
   constructor(
     adapter: DataAdapter,
@@ -165,8 +168,10 @@ export class GitSync {
     token: string,
     username: string,
     repoName: string,
-    isExcluded: (filepath: string) => boolean = () => false
+    isExcluded: (filepath: string) => boolean = () => false,
+    configDir = ".obsidian"
   ) {
+    this.adapter = adapter;
     const normalizedVaultPath = normalizeVaultPath(vaultPath);
     this.fs = createFsAdapter(adapter, normalizedVaultPath);
     this.dir = normalizedVaultPath;
@@ -177,7 +182,135 @@ export class GitSync {
       const normalized = normalizeGitPath(filepath);
       return isBuiltInIgnoredPath(normalized) || isExcluded(normalized);
     };
+    this.configDir = normalizeGitPath(configDir);
     this.mutex = mutexFor(adapter, normalizedVaultPath);
+  }
+
+  /** Inspect one reviewed config file against a freshly fetched remote tree. */
+  async inspectSelectiveConfig(filename: SelectiveConfigFilename): Promise<{
+    local: Uint8Array | null;
+    remote: Uint8Array | null;
+  }> {
+    return this.mutex.run(async () => {
+      this.assertReviewedConfigFilename(filename);
+      await this.recoverInterruptedOperation();
+      if (this.pendingMerge) throw new Error("Resolve the current sync conflict before enabling settings sync.");
+      this.lastFetchError = null;
+      const remoteHead = await this.safeFetch();
+      if (remoteHead === null && this.lastFetchError) throw new Error(this.lastFetchError);
+      const path = `${this.configDir}/${filename}`;
+      return {
+        local: await this.readWorkingBytes(path),
+        remote: remoteHead ? await this.readOptionalBlob(remoteHead, path) : null,
+      };
+    });
+  }
+
+  /**
+   * Atomically adopt fetched bytes, but only if both sides still equal the
+   * snapshots shown to the user. A fresh fetch prevents stale modal decisions.
+   */
+  async adoptSelectiveConfigRemote(
+    filename: SelectiveConfigFilename,
+    expectedLocal: Uint8Array | null,
+    expectedRemote: Uint8Array
+  ): Promise<void> {
+    return this.mutex.run(async () => {
+      this.assertReviewedConfigFilename(filename);
+      await this.recoverInterruptedOperation();
+      if (this.pendingMerge) throw new Error("Resolve the current sync conflict before enabling settings sync.");
+      this.lastFetchError = null;
+      const remoteHead = await this.safeFetch();
+      if (!remoteHead) throw new Error(this.lastFetchError ?? "The synced settings version is no longer available.");
+      const path = `${this.configDir}/${filename}`;
+      const [localNow, remoteNow] = await Promise.all([
+        this.readWorkingBytes(path),
+        this.readOptionalBlob(remoteHead, path),
+      ]);
+      if (!this.sameOptionalBytes(localNow, expectedLocal)) {
+        throw new Error("Local settings changed while choosing a version. Try again.");
+      }
+      if (!remoteNow || !this.sameBytes(remoteNow, expectedRemote)) {
+        throw new Error("Synced settings changed while choosing a version. Try again.");
+      }
+      await this.writeWorkingBytesAtomically(path, remoteNow, expectedLocal);
+    });
+  }
+
+  /** Roll back a completed adoption if the later settings persistence fails. */
+  async restoreSelectiveConfigAfterPersistenceFailure(
+    filename: SelectiveConfigFilename,
+    adoptedRemote: Uint8Array,
+    originalLocal: Uint8Array | null
+  ): Promise<void> {
+    return this.mutex.run(async () => {
+      this.assertReviewedConfigFilename(filename);
+      const path = `${this.configDir}/${filename}`;
+      if (!this.sameOptionalBytes(await this.readWorkingBytes(path), adoptedRemote)) {
+        throw new Error("Local settings changed before adoption could be rolled back.");
+      }
+      if (originalLocal === null) {
+        await this.adapter.remove(path);
+      } else {
+        await this.writeWorkingBytesAtomically(path, originalLocal, adoptedRemote);
+      }
+    });
+  }
+
+  private async readWorkingBytes(path: string): Promise<Uint8Array | null> {
+    try {
+      const value = await this.fs.promises.readFile(this.repoPath(path));
+      return new Uint8Array(Buffer.from(value));
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  private assertReviewedConfigFilename(filename: string): asserts filename is SelectiveConfigFilename {
+    if (filename !== "app.json" && filename !== "hotkeys.json" && filename !== "appearance.json") {
+      throw new Error("Selective settings adoption is limited to reviewed Obsidian configuration files.");
+    }
+  }
+
+  private async readOptionalBlob(oid: string, path: string): Promise<Uint8Array | null> {
+    try {
+      const { blob } = await git.readBlob({ fs: this.fs, dir: this.dir, oid, filepath: path });
+      return new Uint8Array(blob);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/not.?found|does not exist|Could not find/i.test(message)) return null;
+      throw error;
+    }
+  }
+
+  private sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && a.every((byte, index) => byte === b[index]);
+  }
+
+  private sameOptionalBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
+    return a === null || b === null ? a === b : this.sameBytes(a, b);
+  }
+
+  private async writeWorkingBytesAtomically(
+    path: string,
+    bytes: Uint8Array,
+    expectedLocal: Uint8Array | null
+  ): Promise<void> {
+    const temporary = `${path}.gitsyncvault-adoption-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const adapter = this.adapter;
+    try {
+      const copy = new Uint8Array(bytes);
+      await adapter.writeBinary(temporary, copy.buffer);
+      // The temp write may itself take time on a mobile/provider-backed vault.
+      // Revalidate bytes immediately before the atomic rename boundary.
+      if (!this.sameOptionalBytes(await this.readWorkingBytes(path), expectedLocal)) {
+        throw new Error("Local settings changed while choosing a version. Try again.");
+      }
+      await adapter.rename(temporary, path);
+    } finally {
+      try { if (await adapter.exists(temporary)) await adapter.remove(temporary); } catch { /* best-effort temp cleanup */ }
+    }
   }
 
   /** Base options shared by ALL git operations (local and network) */
