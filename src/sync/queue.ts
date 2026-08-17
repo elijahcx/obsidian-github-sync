@@ -10,6 +10,7 @@ type ConflictCallback = (conflicts: ConflictFile[]) => void;
 export class SyncQueue {
   private pendingFiles = new Set<string>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private followupTimer: ReturnType<typeof setTimeout> | null = null;
   private activeFlush: Promise<SyncResult | null> | null = null;
   private conflictPaused = false;
   private shuttingDown = false;
@@ -79,6 +80,10 @@ export class SyncQueue {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
+    if (this.followupTimer) {
+      clearTimeout(this.followupTimer);
+      this.followupTimer = null;
+    }
     if (this.activeFlush) return this.activeFlush;
     return this.flush();
   }
@@ -90,6 +95,10 @@ export class SyncQueue {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
+    }
+    if (this.followupTimer) {
+      clearTimeout(this.followupTimer);
+      this.followupTimer = null;
     }
     this.changed();
     const activeAtShutdown = this.activeFlush;
@@ -173,7 +182,10 @@ export class SyncQueue {
       // Failed batches stay pending but require a later event, manual flush, or
       // unload flush to retry, avoiding an infinite offline retry loop.
       if (this.pendingFiles.size > 0 && !batchFailed && !this.conflictPaused && !this.shuttingDown) {
-        setTimeout(() => this.flush(), 500);
+        this.followupTimer = setTimeout(() => {
+          this.followupTimer = null;
+          void this.flush();
+        }, 500);
       }
     }
   }

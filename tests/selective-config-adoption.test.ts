@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Notice } from "obsidian";
-import MultiSyncPlugin from "../src/main";
+import GitSyncVaultPlugin from "../src/main";
 import { DEFAULT_SETTINGS } from "../src/types";
 import type { SelectiveConfigAdoptionChoice } from "../src/ui/selective-config-adoption-modal";
 
@@ -14,7 +14,7 @@ function pluginFixture(options: {
   saveError?: Error;
   adoptError?: Error;
 } = {}) {
-  const plugin = Object.create(MultiSyncPlugin.prototype) as MultiSyncPlugin & Record<string, unknown>;
+  const plugin = Object.create(GitSyncVaultPlugin.prototype) as GitSyncVaultPlugin & Record<string, unknown>;
   let saves = 0;
   let adoptions = 0;
   let prompts = 0;

@@ -1,5 +1,5 @@
 import { App, PluginSettingTab, Setting, Notice, ButtonComponent } from "obsidian";
-import type MultiSyncPlugin from "../main";
+import type GitSyncVaultPlugin from "../main";
 import { requestDeviceCode, pollForToken } from "../auth/github-device";
 import { getAuthenticatedUser } from "../github/api";
 import type { DeviceFlowResponse } from "../types";
@@ -41,12 +41,12 @@ export function renderDeviceFlowPanel(
   return panel;
 }
 
-export class MultiSyncSettingsTab extends PluginSettingTab {
-  plugin: MultiSyncPlugin;
+export class GitSyncVaultSettingsTab extends PluginSettingTab {
+  plugin: GitSyncVaultPlugin;
   private authAttemptGeneration = 0;
   private activeAuthAttempt: number | null = null;
 
-  constructor(app: App, plugin: MultiSyncPlugin) {
+  constructor(app: App, plugin: GitSyncVaultPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }

@@ -290,6 +290,29 @@ test("shutdown drains pending debounce and waits for an active flush without ove
   assert.deepEqual(queue.getPendingFiles(), []);
 });
 
+test("shutdown owns and clears the delayed follow-up flush timer", async () => {
+  let release!: () => void;
+  const calls: string[][] = [];
+  const sync = { sync: async (files: string[]) => {
+    calls.push(files);
+    if (calls.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+    return { success: true, conflictFiles: [] };
+  } } as unknown as GitSync;
+  const queue = new SyncQueue(sync, () => {}, 10_000);
+  queue.enqueue("first.md");
+  const active = queue.flushNow();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  queue.enqueue("second.md");
+  release();
+  await active;
+
+  const internals = queue as unknown as { followupTimer: ReturnType<typeof setTimeout> | null };
+  assert.notEqual(internals.followupTimer, null);
+  await queue.shutdown();
+  assert.equal(internals.followupTimer, null);
+  assert.deepEqual(calls, [["first.md"], ["second.md"]]);
+});
+
 test("a failed unload flush keeps its batch discoverable", async () => {
   const sync = { sync: async () => ({ success: false, conflictFiles: [], error: "offline" }) } as unknown as GitSync;
   const queue = new SyncQueue(sync, () => {}, 1000);
