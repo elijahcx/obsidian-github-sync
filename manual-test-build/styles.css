@@ -73,7 +73,8 @@
 }
 
 .gitsyncvault-user-code {
-  display: inline-block;
+  display: block;
+  width: fit-content;
   margin: 12px auto;
   padding: 8px 24px;
   border: 2px solid var(--interactive-accent);
@@ -84,6 +85,15 @@
   font-size: 2rem;
   font-weight: 700;
   letter-spacing: 0.25em;
+  line-height: 1.4;
+  white-space: pre;
+  user-select: text;
+  cursor: text;
+}
+
+.gitsyncvault-copy-code {
+  display: block;
+  margin: 0 auto 12px;
 }
 
 @media (max-width: 600px) {
