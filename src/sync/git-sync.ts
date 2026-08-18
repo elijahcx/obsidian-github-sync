@@ -164,6 +164,8 @@ export class GitSync {
   private isExcluded: (filepath: string) => boolean;
   private configDir: string;
 
+  private static readonly ORIGIN_FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*";
+
   constructor(
     adapter: DataAdapter,
     vaultPath: string,
@@ -441,6 +443,7 @@ export class GitSync {
    */
   private async safeFetch(): Promise<string | null> {
     try {
+      await this.ensureOriginConfiguration(false);
       // git.fetch returns the fetched head oid directly. isomorphic-git does not
       // reliably write a FETCH_HEAD ref (especially with a custom fs), so use the
       // return value; fall back to the remote-tracking ref it *does* update.
@@ -472,6 +475,38 @@ export class GitSync {
       const m = e instanceof Error ? e.message : String(e);
       this.lastFetchError = `fetch failed code=${code} msg=${m}`;
       return null;
+    }
+  }
+
+  /**
+   * Keep origin's fetch mapping deterministic without touching repository data.
+   * Routine sync may repair only a repository already connected to the expected
+   * URL; explicit setup flows are allowed to establish/update that connection.
+   */
+  private async ensureOriginConfiguration(updateUrl: boolean): Promise<void> {
+    const urlPath = "remote.origin.url";
+    const fetchPath = "remote.origin.fetch";
+    const configuredUrl = await git.getConfig({ fs: this.fs, dir: this.dir, path: urlPath });
+
+    if (updateUrl) {
+      if (configuredUrl !== this.remoteUrl) {
+        await git.setConfig({ fs: this.fs, dir: this.dir, path: urlPath, value: this.remoteUrl });
+      }
+    } else if (configuredUrl !== this.remoteUrl) {
+      const detail = configuredUrl
+        ? `origin points to '${configuredUrl}' instead of the configured repository`
+        : "origin has no URL";
+      throw new Error(`Refusing to fetch: ${detail}. Reconnect the repository explicitly.`);
+    }
+
+    const configuredFetch = await git.getConfig({ fs: this.fs, dir: this.dir, path: fetchPath });
+    if (configuredFetch !== GitSync.ORIGIN_FETCH_REFSPEC) {
+      await git.setConfig({
+        fs: this.fs,
+        dir: this.dir,
+        path: fetchPath,
+        value: GitSync.ORIGIN_FETCH_REFSPEC,
+      });
     }
   }
 
@@ -716,15 +751,7 @@ export class GitSync {
       // branch. Fetch the actual remote and safely finish local setup instead of
       // deleting either the repository or user working files.
       if (!(await this.hasLocalBranch())) {
-        try {
-          await git.deleteRemote({ fs: this.fs, dir: this.dir, remote: "origin" });
-        } catch { /* partial setup may not have written the remote yet */ }
-        await git.addRemote({
-          fs: this.fs,
-          dir: this.dir,
-          remote: "origin",
-          url: this.remoteUrl,
-        });
+        await this.ensureOriginConfiguration(true);
         const fetchResult = await git.fetch({
           ...this.netOpts(),
           ref: DEFAULT_BRANCH,
@@ -837,16 +864,8 @@ export class GitSync {
       throw new Error(`Initialization failed: could not establish local branch '${DEFAULT_BRANCH}'.`);
     }
 
-    // Set up remote (delete+re-add to ensure correct fetch refspec)
-    try {
-      await git.deleteRemote({ fs: this.fs, dir: this.dir, remote: "origin" });
-    } catch { /* didn't exist yet */ }
-    await git.addRemote({
-      fs: this.fs,
-      dir: this.dir,
-      remote: "origin",
-      url: this.remoteUrl,
-    });
+    // Explicit setup establishes both the selected URL and canonical fetch map.
+    await this.ensureOriginConfiguration(true);
 
     try {
       const localHead = await git.resolveRef({
